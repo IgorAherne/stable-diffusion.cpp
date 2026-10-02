@@ -961,6 +961,12 @@ public:
           eps(eps),
           elementwise_affine(elementwise_affine) {}
 
+    // For callers that fold this norm into a fused op: eps and the unpatched weight (nullptr without
+    // elementwise_affine). forward() patches the weight when a weight adapter (LoRA) is active, so such callers must
+    // use forward() then.
+    float get_eps() const { return eps; }
+    ggml_tensor* unpatched_weight() { return elementwise_affine ? params["weight"] : nullptr; }
+
     ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
         if (!elementwise_affine) {
             return ggml_rms_norm(ctx->ggml_ctx, x, eps);

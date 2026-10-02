@@ -1,6 +1,8 @@
 #ifndef __SD_MODEL_DIFFUSION_QWEN_IMAGE_2_1_H__
 #define __SD_MODEL_DIFFUSION_QWEN_IMAGE_2_1_H__
 
+#include <typeinfo>
+
 #include "model/diffusion/qwen_image.hpp"
 
 namespace Qwen {
@@ -264,6 +266,31 @@ namespace Qwen {
             return std::dynamic_pointer_cast<Linear>(blocks["to_out.0"])->deferred_output_scale(ctx);
         }
 
+        // blocks[norm_name] (RMSNorm) then qwen_image_2_1_apply_rope. Where the fused rope runs, one
+        // ggml_rms_norm_mul_rope_table op instead (the backend's RMS_NORM + MUL arithmetic, bit-identical), unless a
+        // weight adapter (LoRA) is active or the weight is not a plain F32 [d_head] tensor on the runtime backend's
+        // device (or in host memory).
+        ggml_tensor* norm_rope(GGMLRunnerContext* ctx, ggml_tensor* x, const char* norm_name, const QwenImage21Rope& rope) {
+            auto norm = std::dynamic_pointer_cast<RMSNorm>(blocks[norm_name]);
+#ifndef SD_USE_UPSTREAM_GGML
+            ggml_tensor* w = norm->unpatched_weight();
+            auto on_runtime_device = [&](ggml_tensor* t) {
+                return t->buffer == nullptr || ggml_backend_buffer_is_host(t->buffer) ||
+                       ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer)) == ggml_backend_get_device(ctx->backend);
+            };
+            // (exactly RMSNorm: a subclass may compute something else in forward)
+            if (rope.fused && typeid(*norm) == typeid(RMSNorm) && ctx->weight_adapter == nullptr && w != nullptr && w->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(w) && ggml_nelements(w) == x->ne[0] && on_runtime_device(w) &&
+                x->type == GGML_TYPE_F32 && x->nb[0] == ggml_type_size(GGML_TYPE_F32) && rope.pe->ne[3] == x->ne[2]) {
+                auto out = ggml_rms_norm_mul_rope_table(ctx->ggml_ctx, x, w, norm->get_eps(), rope.pe, GGML_TYPE_F32);
+                if (ggml_backend_supports_op(ctx->backend, out)) {
+                    return ggml_reshape_3d(ctx->ggml_ctx, out, x->ne[0], x->ne[2], x->ne[1] * x->ne[3]);  // [N*n_head, L, d_head]
+                }
+            }
+#endif
+            return qwen_image_2_1_apply_rope(ctx->ggml_ctx, norm->forward(ctx, x), rope);
+        }
+
         ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, const QwenImage21Rope& rope, const std::vector<QwenImage21Segment>& segments, const std::vector<ggml_tensor*>& masks, const QwenImage21PrefixCache& cache, bool defer_out_scale = false) {
             int64_t heads = x->ne[0] / dim_head;
             auto project  = [&](const char* name) {
@@ -273,10 +300,8 @@ namespace Qwen {
             auto q = project("to_q");
             auto k = project("to_k");
             auto v = project("to_v");
-            q      = std::dynamic_pointer_cast<RMSNorm>(blocks["norm_q"])->forward(ctx, q);
-            k      = std::dynamic_pointer_cast<RMSNorm>(blocks["norm_k"])->forward(ctx, k);
-            q      = qwen_image_2_1_apply_rope(ctx->ggml_ctx, q, rope);
-            k      = qwen_image_2_1_apply_rope(ctx->ggml_ctx, k, rope);
+            q      = norm_rope(ctx, q, "norm_q", rope);
+            k      = norm_rope(ctx, k, "norm_k", rope);
             if (cache.mode == QwenImage21PrefixCache::Mode::STORE) {
                 // Preserve query-first attention evaluation while writing each layer's
                 // prefix before its full-sequence K/V can accumulate across layers.
