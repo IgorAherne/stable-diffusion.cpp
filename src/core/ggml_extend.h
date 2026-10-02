@@ -65,12 +65,14 @@ ggml_tensor* ggml_ext_gelu_quick(ggml_context* ctx,
                                  ggml_tensor* x,
                                  bool inplace = false);
 
+// undo_scale = false leaves the output multiplied by `scale` (the caller applies 1/scale itself).
 ggml_tensor* ggml_ext_linear(ggml_context* ctx,
                              ggml_tensor* x,
                              ggml_tensor* w,
                              ggml_tensor* b,
                              bool force_prec_f32 = false,
-                             float scale         = 1.f);
+                             float scale         = 1.f,
+                             bool undo_scale     = true);
 
 ggml_tensor* ggml_ext_linear_i8_tensorwise(ggml_context* ctx,
                                            ggml_tensor* x,

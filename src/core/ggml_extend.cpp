@@ -212,7 +212,9 @@ ggml_tensor* ggml_ext_linear(ggml_context* ctx,
                              ggml_tensor* w,
                              ggml_tensor* b,
                              bool force_prec_f32,
-                             float scale) {
+                             float scale,
+                             bool undo_scale) {
+    GGML_ASSERT(undo_scale || b == nullptr || scale == 1.f);
     if (scale != 1.f) {
         x = ggml_ext_scale(ctx, x, scale);
     }
@@ -232,7 +234,7 @@ ggml_tensor* ggml_ext_linear(ggml_context* ctx,
             ggml_mul_mat_set_prec(x, GGML_PREC_F32);
         }
     }
-    if (scale != 1.f) {
+    if (scale != 1.f && undo_scale) {
         x = ggml_ext_scale(ctx, x, 1.f / scale);
     }
     if (b != nullptr) {

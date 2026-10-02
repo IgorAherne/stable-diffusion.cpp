@@ -205,6 +205,39 @@ public:
         force_prec_f32 = force_prec_f32_;
     }
 
+    // The factor forward_deferring_output_scale() leaves for the caller to apply: 1/scale when this Linear scales its
+    // input by an exact power of two (so multiplying by 1/scale later instead of right after the matmul gives the same
+    // products) and only the plain matmul path runs (no LoRA/weight adapter, no ctx->linear_scale override, no int8,
+    // fp8 or weight-scaled weights, no bias); otherwise 1.
+    float deferred_output_scale(GGMLRunnerContext* ctx) {
+        if (scale == 1.f || ctx->weight_adapter || ctx->linear_scale > 0.f || bias || has_weight_scale) {
+            return 1.f;
+        }
+        int exponent = 0;
+        if (!std::isfinite(scale) || std::frexp(scale, &exponent) != 0.5f) {
+            return 1.f;
+        }
+        ggml_tensor* w = params["weight"];
+        if (w->type == GGML_TYPE_I8) {
+            return 1.f;
+        }
+#ifndef SD_USE_UPSTREAM_GGML
+        if (w->type == GGML_TYPE_F8_E4M3 || w->type == GGML_TYPE_F8_E5M2) {
+            return 1.f;
+        }
+#endif
+        return 1.f / scale;
+    }
+
+    // forward(), but when deferred_output_scale(ctx) != 1 the output is left multiplied by `scale`: the caller must
+    // multiply it by deferred_output_scale(ctx) (or fold that factor into a later multiplication).
+    ggml_tensor* forward_deferring_output_scale(GGMLRunnerContext* ctx, ggml_tensor* x) {
+        if (deferred_output_scale(ctx) == 1.f) {
+            return forward(ctx, x);
+        }
+        return ggml_ext_linear(ctx->ggml_ctx, x, params["weight"], nullptr, force_prec_f32, scale, false);
+    }
+
     ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
         ggml_tensor* w            = params["weight"];
         const float scale         = ctx->linear_scale > 0.f ? ctx->linear_scale : this->scale;

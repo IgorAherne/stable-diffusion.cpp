@@ -223,8 +223,14 @@ namespace Qwen {
             }
         }
 
+        // The factor forward(..., defer_out_scale = true) leaves for the caller to apply (to_out's deferred output
+        // scale, see Linear::deferred_output_scale); 1 when it cannot be deferred.
+        float deferred_output_scale(GGMLRunnerContext* ctx) {
+            return std::dynamic_pointer_cast<Linear>(blocks["to_out.0"])->deferred_output_scale(ctx);
+        }
+
         // pe: the rope table from qwen_image_2_1_rope_table
-        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* pe, const std::vector<QwenImage21Segment>& segments, const std::vector<ggml_tensor*>& masks, const QwenImage21PrefixCache& cache) {
+        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* pe, const std::vector<QwenImage21Segment>& segments, const std::vector<ggml_tensor*>& masks, const QwenImage21PrefixCache& cache, bool defer_out_scale = false) {
             int64_t heads = x->ne[0] / dim_head;
             auto project  = [&](const char* name) {
                 auto h = std::dynamic_pointer_cast<Linear>(blocks[name])->forward(ctx, x);
@@ -294,7 +300,7 @@ namespace Qwen {
             if (sd_backend_is(ctx->backend, "Vulkan") || sd_backend_is(ctx->backend, "ROCm")) {
                 to_out->set_force_prec_f32(true);
             }
-            return to_out->forward(ctx, result);
+            return defer_out_scale ? to_out->forward_deferring_output_scale(ctx, result) : to_out->forward(ctx, result);
         }
     };
 
@@ -315,14 +321,19 @@ namespace Qwen {
 
         // The factors one of the four modulation chunks ([hidden, 2]: row 0 for the image being drawn, row 1, the
         // zero timestep, for the prefix tokens) multiplies the tokens by: 1 + scale, or tanh(gate). They are the same
-        // for every layer, so the model builds them once per graph instead of once per layer.
-        static QwenImage21ModulationRows modulation_rows(GGMLRunnerContext* ctx, ggml_tensor* params, bool with_prefix, bool gate) {
+        // for every layer, so the model builds them once per graph instead of once per layer. factor: an exact power
+        // of two the gated branch's output still has to be multiplied by (folded into the row).
+        static QwenImage21ModulationRows modulation_rows(GGMLRunnerContext* ctx, ggml_tensor* params, bool with_prefix, bool gate, float factor = 1.f) {
             GGML_ASSERT(params->nb[0] == ggml_type_size(params->type) && params->ne[1] == 2);
+            GGML_ASSERT(gate || factor == 1.f);
             auto row = [&](int64_t index) {
                 // A 1-D view of the row ([hidden], contiguous): no copy, and ggml_mul broadcasts it exactly like
                 // the old [hidden, 1] contiguous chunk.
                 auto r = ggml_view_1d(ctx->ggml_ctx, params, params->ne[0], index * params->nb[1]);
                 r      = gate ? ggml_tanh(ctx->ggml_ctx, r) : ggml_scale_bias(ctx->ggml_ctx, r, 1.f, 1.f);
+                if (factor != 1.f) {
+                    r = ggml_scale(ctx->ggml_ctx, r, factor);
+                }
                 ctx->expand_graph(r);
                 return r;
             };
@@ -346,11 +357,17 @@ namespace Qwen {
             return ggml_concat(ctx, prefix, target, 1);
         }
 
-        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, const std::vector<QwenImage21ModulationRows>& modulation, ggml_tensor* pe, const QwenImage21Layout& layout, const std::vector<ggml_tensor*>& masks, const QwenImage21PrefixCache& cache) {
+        float attn_deferred_output_scale(GGMLRunnerContext* ctx) {
+            return std::dynamic_pointer_cast<QwenImage21Attention>(blocks["attn"])->deferred_output_scale(ctx);
+        }
+
+        // attn_out_scale_folded: modulation[1] already includes the attention's deferred output scale
+        // (attn_deferred_output_scale), so the attention leaves it out.
+        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, const std::vector<QwenImage21ModulationRows>& modulation, ggml_tensor* pe, const QwenImage21Layout& layout, const std::vector<ggml_tensor*>& masks, const QwenImage21PrefixCache& cache, bool attn_out_scale_folded = false) {
             const int64_t prefix_length = cache.mode == QwenImage21PrefixCache::Mode::REUSE ? 0 : layout.prefix_length;
             auto h                      = std::dynamic_pointer_cast<LayerNorm>(blocks["img_norm1"])->forward(ctx, x);
             h                           = modulate(ctx->ggml_ctx, h, modulation[0], prefix_length);
-            h                           = std::dynamic_pointer_cast<QwenImage21Attention>(blocks["attn"])->forward(ctx, h, pe, layout.segments, masks, cache);
+            h                           = std::dynamic_pointer_cast<QwenImage21Attention>(blocks["attn"])->forward(ctx, h, pe, layout.segments, masks, cache, attn_out_scale_folded);
             x                           = ggml_add(ctx->ggml_ctx, x, modulate(ctx->ggml_ctx, h, modulation[1], prefix_length));
             h                           = std::dynamic_pointer_cast<LayerNorm>(blocks["img_norm2"])->forward(ctx, x);
             h                           = modulate(ctx->ggml_ctx, h, modulation[2], prefix_length);
@@ -405,9 +422,21 @@ namespace Qwen {
             auto mod           = ggml_ext_chunk(ctx->ggml_ctx, modulation, 4, 0);
             // Chunks 0 and 2 scale the normed tokens (1 + scale), 1 and 3 gate the residual branches (tanh).
             const bool with_prefix = cache.mode != QwenImage21PrefixCache::Mode::REUSE && layout.prefix_length > 0;
+            // Each attention's to_out scales its input by 1/32 and its output back by 32 (against NaN with k-quants).
+            // When every layer can defer that x32 (no LoRA, no linear_scale override, plain weights), fold it into the
+            // attention gate rows instead: (32 h) tanh(g) and h (32 tanh(g)) are the same real product (x32 is exact),
+            // so the rounded results are identical, and one 64 MiB scale per layer goes away.
+            float attn_out_scale = 0.f;
+            for (int i = 0; i < config.num_layers; ++i) {
+                auto block    = std::dynamic_pointer_cast<QwenImage21TransformerBlock>(blocks["transformer_blocks." + std::to_string(i)]);
+                const float f = block->attn_deferred_output_scale(ctx);
+                attn_out_scale = (attn_out_scale == 0.f || attn_out_scale == f) ? f : 1.f;
+            }
+            const bool attn_out_scale_folded = attn_out_scale != 0.f && attn_out_scale != 1.f;
             std::vector<QwenImage21ModulationRows> mod_rows;
             for (int i = 0; i < 4; ++i) {
-                mod_rows.push_back(QwenImage21TransformerBlock::modulation_rows(ctx, mod[i], with_prefix, i % 2 == 1));
+                mod_rows.push_back(QwenImage21TransformerBlock::modulation_rows(ctx, mod[i], with_prefix, i % 2 == 1,
+                                                                                i == 1 && attn_out_scale_folded ? attn_out_scale : 1.f));
             }
             // The blocks take the rope table in qwen_image_2_1_apply_rope's layout.
             auto pe_table = qwen_image_2_1_rope_table(ctx->ggml_ctx, pe);
@@ -437,7 +466,7 @@ namespace Qwen {
                 layer_cache.name        = cache.name + "." + std::to_string(i);
                 layer_cache.cut_group   = "qwen_image_2_1." + layer;
                 auto block              = std::dynamic_pointer_cast<QwenImage21TransformerBlock>(blocks[layer]);
-                joint                   = block->forward(ctx, joint, mod_rows, pe_table, layout, masks, layer_cache);
+                joint                   = block->forward(ctx, joint, mod_rows, pe_table, layout, masks, layer_cache, attn_out_scale_folded);
                 sd::ggml_graph_cut::mark_graph_cut(joint, layer_cache.cut_group, "joint");
             }
             if (cache.mode != QwenImage21PrefixCache::Mode::REUSE) {
