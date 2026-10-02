@@ -143,6 +143,47 @@ namespace Qwen {
         bool* flash_attn_used = nullptr;
     };
 
+    // Rope::apply_rope's permute of the table (pe [2, 2, d_head/2, L] -> [2, d_head/2, L, 2]), done once per graph and
+    // shared by every layer's q and k instead of once per apply_rope call.
+    __STATIC_INLINE__ ggml_tensor* qwen_image_2_1_rope_table(ggml_context* ctx, ggml_tensor* pe) {
+        return ggml_cont(ctx, ggml_permute(ctx, pe, 3, 0, 1, 2));
+    }
+
+    // Rope::apply_rope (interleaved), same operations and results, with the table from qwen_image_2_1_rope_table.
+    // x: [d_head, n_head, L, N] -> [d_head, L, n_head * N]
+    __STATIC_INLINE__ ggml_tensor* qwen_image_2_1_apply_rope(ggml_context* ctx, ggml_tensor* x, ggml_tensor* pe_table) {
+        int64_t d_head = x->ne[0];
+        int64_t n_head = x->ne[1];
+        int64_t L      = x->ne[2];
+        int64_t N      = x->ne[3];
+        if (N == 1 && ggml_is_contiguous(x)) {
+            // One copy instead of two: element (j, l, h, c) = x[2j + c, h, l], the same [d_head/2, L, n_head, 2]
+            // tensor apply_rope builds with permute(0, 2, 1, 3), reshape and permute(3, 0, 1, 2).
+            x = ggml_reshape_4d(ctx, x, 2, d_head / 2, n_head, L);
+            x = ggml_cont(ctx, ggml_permute(ctx, x, 3, 0, 2, 1));  // [2, n_head, L, d_head/2]
+        } else {
+            x = ggml_cont(ctx, ggml_permute(ctx, x, 0, 2, 1, 3));       // [N, n_head, L, d_head]
+            x = ggml_reshape_4d(ctx, x, 2, d_head / 2, L, n_head * N);  // [N * n_head, L, d_head/2, 2]
+            x = ggml_cont(ctx, ggml_permute(ctx, x, 3, 0, 1, 2));       // [2, N * n_head, L, d_head/2]
+        }
+
+        int64_t offset = x->nb[2] * x->ne[2];
+        auto x_0       = ggml_view_3d(ctx, x, x->ne[0], x->ne[1], x->ne[2], x->nb[1], x->nb[2], offset * 0);  // [N * n_head, L, d_head/2]
+        auto x_1       = ggml_view_3d(ctx, x, x->ne[0], x->ne[1], x->ne[2], x->nb[1], x->nb[2], offset * 1);  // [N * n_head, L, d_head/2]
+        x_0            = ggml_reshape_4d(ctx, x_0, 1, x_0->ne[0], x_0->ne[1], x_0->ne[2]);                    // [N * n_head, L, d_head/2, 1]
+        x_1            = ggml_reshape_4d(ctx, x_1, 1, x_1->ne[0], x_1->ne[1], x_1->ne[2]);                    // [N * n_head, L, d_head/2, 1]
+        auto temp_x    = ggml_new_tensor_4d(ctx, x_0->type, 2, x_0->ne[1], x_0->ne[2], x_0->ne[3]);
+        x_0            = ggml_repeat(ctx, x_0, temp_x);  // [N * n_head, L, d_head/2, 2]
+        x_1            = ggml_repeat(ctx, x_1, temp_x);  // [N * n_head, L, d_head/2, 2]
+
+        offset    = pe_table->nb[2] * pe_table->ne[2];
+        auto pe_0 = ggml_view_3d(ctx, pe_table, pe_table->ne[0], pe_table->ne[1], pe_table->ne[2], pe_table->nb[1], pe_table->nb[2], offset * 0);  // [L, d_head/2, 2]
+        auto pe_1 = ggml_view_3d(ctx, pe_table, pe_table->ne[0], pe_table->ne[1], pe_table->ne[2], pe_table->nb[1], pe_table->nb[2], offset * 1);  // [L, d_head/2, 2]
+
+        auto x_out = ggml_add_inplace(ctx, ggml_mul(ctx, x_0, pe_0), ggml_mul(ctx, x_1, pe_1));  // [N * n_head, L, d_head/2, 2]
+        return ggml_reshape_3d(ctx, x_out, d_head, L, n_head * N);                                // [N*n_head, L, d_head]
+    }
+
     class QwenImage21ZeroCenterRMSNorm : public RMSNorm {
     public:
         using RMSNorm::RMSNorm;
@@ -182,6 +223,7 @@ namespace Qwen {
             }
         }
 
+        // pe: the rope table from qwen_image_2_1_rope_table
         ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* pe, const std::vector<QwenImage21Segment>& segments, const std::vector<ggml_tensor*>& masks, const QwenImage21PrefixCache& cache) {
             int64_t heads = x->ne[0] / dim_head;
             auto project  = [&](const char* name) {
@@ -193,8 +235,8 @@ namespace Qwen {
             auto v = project("to_v");
             q      = std::dynamic_pointer_cast<RMSNorm>(blocks["norm_q"])->forward(ctx, q);
             k      = std::dynamic_pointer_cast<RMSNorm>(blocks["norm_k"])->forward(ctx, k);
-            q      = Rope::apply_rope(ctx->ggml_ctx, q, pe);
-            k      = Rope::apply_rope(ctx->ggml_ctx, k, pe);
+            q      = qwen_image_2_1_apply_rope(ctx->ggml_ctx, q, pe);
+            k      = qwen_image_2_1_apply_rope(ctx->ggml_ctx, k, pe);
             if (cache.mode == QwenImage21PrefixCache::Mode::STORE) {
                 // Preserve query-first attention evaluation while writing each layer's
                 // prefix before its full-sequence K/V can accumulate across layers.
@@ -366,6 +408,9 @@ namespace Qwen {
             for (int i = 0; i < 4; ++i) {
                 mod_rows.push_back(QwenImage21TransformerBlock::modulation_rows(ctx, mod[i], with_prefix, i % 2 == 1));
             }
+            // The blocks take the rope table in qwen_image_2_1_apply_rope's layout.
+            auto pe_table = qwen_image_2_1_rope_table(ctx->ggml_ctx, pe);
+            ctx->expand_graph(pe_table);
             auto img_in        = std::dynamic_pointer_cast<Linear>(blocks["img_in"]);
             ggml_tensor* joint = nullptr;
             if (cache.mode == QwenImage21PrefixCache::Mode::REUSE) {
@@ -391,7 +436,7 @@ namespace Qwen {
                 layer_cache.name        = cache.name + "." + std::to_string(i);
                 layer_cache.cut_group   = "qwen_image_2_1." + layer;
                 auto block              = std::dynamic_pointer_cast<QwenImage21TransformerBlock>(blocks[layer]);
-                joint                   = block->forward(ctx, joint, mod_rows, pe, layout, masks, layer_cache);
+                joint                   = block->forward(ctx, joint, mod_rows, pe_table, layout, masks, layer_cache);
                 sd::ggml_graph_cut::mark_graph_cut(joint, layer_cache.cut_group, "joint");
             }
             if (cache.mode != QwenImage21PrefixCache::Mode::REUSE) {
