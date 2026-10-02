@@ -696,9 +696,10 @@ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
 
         if (strided_f32_v && !pad_head && kv_scale == 1.0f && N == 1 && v_in->type == GGML_TYPE_F32 &&
             v_in->nb[0] == ggml_type_size(GGML_TYPE_F32) && sd_backend_supports_cuda_mma(backend)) {
-            // CUDA's MMA/tile flash attention converts a non-F16 V to F16 itself (to_fp16_nc for a strided one,
-            // ggml_cuda_cast<half> like the cast below) into the same contiguous [d_head, L_k, n_kv_head] layout,
-            // so the permuted F32 view gives the same halves without the F32 permute copy and the separate cast.
+            // CUDA's MMA/tile flash attention converts a non-F16 V to F16 itself with ggml_cuda_cast<half>, like the
+            // cast below (a permuted view of a contiguous tensor is converted in memory order and keeps its permuted
+            // strides, a view with gaps goes through to_fp16_nc), and reads V through its strides, so the permuted F32
+            // view gives the kernel the same halves without the F32 permute copy and the separate cast.
             v_in = ggml_permute(ctx, v_in, 0, 2, 1, 3);  // [N, n_kv_head, L_k, d_head], a view
         } else {
             v_in = ggml_ext_cont(ctx, ggml_permute(ctx, v_in, 0, 2, 1, 3));
