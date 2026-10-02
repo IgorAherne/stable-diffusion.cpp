@@ -124,6 +124,11 @@ namespace Qwen {
         }
     };
 
+    struct QwenImage21ModulationRows {
+        ggml_tensor* target = nullptr;  // [hidden] factor for the image being drawn
+        ggml_tensor* prefix = nullptr;  // [hidden] factor for the prefix tokens (text, example pictures); null in REUSE
+    };
+
     struct QwenImage21PrefixCache {
         enum class Mode {
             NONE,
@@ -265,26 +270,45 @@ namespace Qwen {
             blocks["img_mlp.out"] = std::make_shared<Linear>(config.intermediate_size, config.hidden_size, false);
         }
 
-        static ggml_tensor* modulate(ggml_context* ctx, ggml_tensor* x, ggml_tensor* params, int64_t prefix_length, bool gate = false) {
-            auto rows  = ggml_ext_chunk(ctx, params, 2, 1);
-            auto apply = [&](ggml_tensor* part, ggml_tensor* row) {
-                row = gate ? ggml_tanh(ctx, row) : ggml_scale_bias(ctx, row, 1.f, 1.f);
-                return ggml_mul(ctx, part, row);
+        // The factors one of the four modulation chunks ([hidden, 2]: row 0 for the image being drawn, row 1, the
+        // zero timestep, for the prefix tokens) multiplies the tokens by: 1 + scale, or tanh(gate). They are the same
+        // for every layer, so the model builds them once per graph instead of once per layer.
+        static QwenImage21ModulationRows modulation_rows(GGMLRunnerContext* ctx, ggml_tensor* params, bool with_prefix, bool gate) {
+            GGML_ASSERT(params->nb[0] == ggml_type_size(params->type) && params->ne[1] == 2);
+            auto row = [&](int64_t index) {
+                // A 1-D view of the row ([hidden], contiguous): no copy, and ggml_mul broadcasts it exactly like
+                // the old [hidden, 1] contiguous chunk.
+                auto r = ggml_view_1d(ctx->ggml_ctx, params, params->ne[0], index * params->nb[1]);
+                r      = gate ? ggml_tanh(ctx->ggml_ctx, r) : ggml_scale_bias(ctx->ggml_ctx, r, 1.f, 1.f);
+                ctx->expand_graph(r);
+                return r;
             };
-            auto target = apply(ggml_ext_slice(ctx, x, 1, prefix_length, x->ne[1]), rows[0]);
-            if (prefix_length == 0) {
-                return target;
+            QwenImage21ModulationRows rows;
+            rows.target = row(0);
+            if (with_prefix) {
+                rows.prefix = row(1);
             }
-            auto prefix = apply(ggml_ext_slice(ctx, x, 1, 0, prefix_length), rows[1]);
+            return rows;
+        }
+
+        static ggml_tensor* modulate(ggml_context* ctx, ggml_tensor* x, const QwenImage21ModulationRows& rows, int64_t prefix_length) {
+            if (prefix_length == 0) {
+                // All tokens are the image being drawn (prefix-cache REUSE): multiply x itself, no slice copy.
+                return ggml_mul(ctx, x, rows.target);
+            }
+            GGML_ASSERT(rows.prefix != nullptr);
+            // Views, not copies: ggml_mul reads the strided parts and writes new contiguous tensors.
+            auto target = ggml_mul(ctx, ggml_ext_slice(ctx, x, 1, prefix_length, x->ne[1], false), rows.target);
+            auto prefix = ggml_mul(ctx, ggml_ext_slice(ctx, x, 1, 0, prefix_length, false), rows.prefix);
             return ggml_concat(ctx, prefix, target, 1);
         }
 
-        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, const std::vector<ggml_tensor*>& modulation, ggml_tensor* pe, const QwenImage21Layout& layout, const std::vector<ggml_tensor*>& masks, const QwenImage21PrefixCache& cache) {
+        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, const std::vector<QwenImage21ModulationRows>& modulation, ggml_tensor* pe, const QwenImage21Layout& layout, const std::vector<ggml_tensor*>& masks, const QwenImage21PrefixCache& cache) {
             const int64_t prefix_length = cache.mode == QwenImage21PrefixCache::Mode::REUSE ? 0 : layout.prefix_length;
             auto h                      = std::dynamic_pointer_cast<LayerNorm>(blocks["img_norm1"])->forward(ctx, x);
             h                           = modulate(ctx->ggml_ctx, h, modulation[0], prefix_length);
             h                           = std::dynamic_pointer_cast<QwenImage21Attention>(blocks["attn"])->forward(ctx, h, pe, layout.segments, masks, cache);
-            x                           = ggml_add(ctx->ggml_ctx, x, modulate(ctx->ggml_ctx, h, modulation[1], prefix_length, true));
+            x                           = ggml_add(ctx->ggml_ctx, x, modulate(ctx->ggml_ctx, h, modulation[1], prefix_length));
             h                           = std::dynamic_pointer_cast<LayerNorm>(blocks["img_norm2"])->forward(ctx, x);
             h                           = modulate(ctx->ggml_ctx, h, modulation[2], prefix_length);
             auto fused = blocks.find("img_mlp.gate_up");
@@ -306,7 +330,7 @@ namespace Qwen {
                 h         = ggml_mul(ctx->ggml_ctx, h, ggml_silu(ctx->ggml_ctx, gate));
             }
             h = std::dynamic_pointer_cast<Linear>(blocks["img_mlp.out"])->forward(ctx, h);
-            return ggml_add(ctx->ggml_ctx, x, modulate(ctx->ggml_ctx, h, modulation[3], prefix_length, true));
+            return ggml_add(ctx->ggml_ctx, x, modulate(ctx->ggml_ctx, h, modulation[3], prefix_length));
         }
     };
 
@@ -336,6 +360,12 @@ namespace Qwen {
             time               = ggml_silu(ctx->ggml_ctx, time);
             auto modulation    = std::dynamic_pointer_cast<Linear>(blocks["modulation.1"])->forward(ctx, time);
             auto mod           = ggml_ext_chunk(ctx->ggml_ctx, modulation, 4, 0);
+            // Chunks 0 and 2 scale the normed tokens (1 + scale), 1 and 3 gate the residual branches (tanh).
+            const bool with_prefix = cache.mode != QwenImage21PrefixCache::Mode::REUSE && layout.prefix_length > 0;
+            std::vector<QwenImage21ModulationRows> mod_rows;
+            for (int i = 0; i < 4; ++i) {
+                mod_rows.push_back(QwenImage21TransformerBlock::modulation_rows(ctx, mod[i], with_prefix, i % 2 == 1));
+            }
             auto img_in        = std::dynamic_pointer_cast<Linear>(blocks["img_in"]);
             ggml_tensor* joint = nullptr;
             if (cache.mode == QwenImage21PrefixCache::Mode::REUSE) {
@@ -361,7 +391,7 @@ namespace Qwen {
                 layer_cache.name        = cache.name + "." + std::to_string(i);
                 layer_cache.cut_group   = "qwen_image_2_1." + layer;
                 auto block              = std::dynamic_pointer_cast<QwenImage21TransformerBlock>(blocks[layer]);
-                joint                   = block->forward(ctx, joint, mod, pe, layout, masks, layer_cache);
+                joint                   = block->forward(ctx, joint, mod_rows, pe, layout, masks, layer_cache);
                 sd::ggml_graph_cut::mark_graph_cut(joint, layer_cache.cut_group, "joint");
             }
             if (cache.mode != QwenImage21PrefixCache::Mode::REUSE) {
