@@ -287,18 +287,24 @@ namespace Qwen {
             x                           = ggml_add(ctx->ggml_ctx, x, modulate(ctx->ggml_ctx, h, modulation[1], prefix_length, true));
             h                           = std::dynamic_pointer_cast<LayerNorm>(blocks["img_norm2"])->forward(ctx, x);
             h                           = modulate(ctx->ggml_ctx, h, modulation[2], prefix_length);
-            ggml_tensor* gate;
             auto fused = blocks.find("img_mlp.gate_up");
             if (fused != blocks.end()) {
                 auto gate_up = std::dynamic_pointer_cast<Linear>(fused->second)->forward(ctx, h);
-                auto parts   = ggml_ext_chunk(ctx->ggml_ctx, gate_up, 2, 0);
-                gate         = parts[0];
-                h            = parts[1];
+                // gate_up = [gate | up] along ne0. ggml_swiglu (not swapped) computes silu(first half) * second half
+                // straight from gate_up, the same per-element silu(gate) * up as the chunk + silu + mul below
+                // (on CUDA even the same unary_gated_op_kernel<op_silu>), without copying both halves out first.
+                auto swiglu = ggml_swiglu(ctx->ggml_ctx, gate_up);
+                if (ctx->backend != nullptr && ggml_backend_supports_op(ctx->backend, swiglu)) {
+                    h = swiglu;
+                } else {
+                    auto parts = ggml_ext_chunk(ctx->ggml_ctx, gate_up, 2, 0);
+                    h          = ggml_mul(ctx->ggml_ctx, parts[1], ggml_silu(ctx->ggml_ctx, parts[0]));
+                }
             } else {
-                gate = std::dynamic_pointer_cast<Linear>(blocks["img_mlp.gate_layer"])->forward(ctx, h);
-                h    = std::dynamic_pointer_cast<Linear>(blocks["img_mlp.proj"])->forward(ctx, h);
+                auto gate = std::dynamic_pointer_cast<Linear>(blocks["img_mlp.gate_layer"])->forward(ctx, h);
+                h         = std::dynamic_pointer_cast<Linear>(blocks["img_mlp.proj"])->forward(ctx, h);
+                h         = ggml_mul(ctx->ggml_ctx, h, ggml_silu(ctx->ggml_ctx, gate));
             }
-            h = ggml_mul(ctx->ggml_ctx, h, ggml_silu(ctx->ggml_ctx, gate));
             h = std::dynamic_pointer_cast<Linear>(blocks["img_mlp.out"])->forward(ctx, h);
             return ggml_add(ctx->ggml_ctx, x, modulate(ctx->ggml_ctx, h, modulation[3], prefix_length, true));
         }
