@@ -149,13 +149,48 @@ namespace Qwen {
         return ggml_cont(ctx, ggml_permute(ctx, pe, 3, 0, 1, 2));
     }
 
-    // Rope::apply_rope (interleaved), same operations and results, with the table from qwen_image_2_1_rope_table.
+    // The rotary embedding the blocks apply to q and k (qwen_image_2_1_apply_rope): pe as the model builds it
+    // ([2, 2, d_head/2, L]) for the fused ggml_rope_table op, or, where the backend does not have that op, the
+    // decomposition's table (qwen_image_2_1_rope_table(pe), permuted once per graph).
+    struct QwenImage21Rope {
+        ggml_tensor* pe    = nullptr;
+        ggml_tensor* table = nullptr;  // set when !fused
+        bool fused         = false;
+    };
+
+    // Whether the backend runs ggml_rope_table for q/k shaped [d_head, n_head, L, 1] (F32, rows contiguous) and pe.
+    __STATIC_INLINE__ bool qwen_image_2_1_rope_table_supported(ggml_context* ctx, ggml_backend_t backend, ggml_tensor* pe, int64_t d_head, int64_t n_head) {
+#ifndef SD_USE_UPSTREAM_GGML
+        if (backend == nullptr || pe == nullptr || pe->type != GGML_TYPE_F32 || !ggml_is_contiguous(pe) ||
+            pe->ne[0] != 2 || pe->ne[1] != 2 || pe->ne[2] * 2 != d_head) {
+            return false;
+        }
+        // a probe node on an unallocated tensor of q's shape: supports_op only looks at types, shapes and strides
+        auto probe_x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d_head, n_head, pe->ne[3], 1);
+        auto probe   = ggml_rope_table(ctx, probe_x, pe, GGML_TYPE_F32);
+        return ggml_backend_supports_op(backend, probe);
+#else
+        return false;
+#endif
+    }
+
+    // Rope::apply_rope (interleaved), same results. Fused: one ggml_rope_table op (no permute copies, repeats, muls
+    // and add; each product and the sum rounded to F32 on its own, so bit-identical). Otherwise the same operations as
+    // Rope::apply_rope, with the table from qwen_image_2_1_rope_table.
     // x: [d_head, n_head, L, N] -> [d_head, L, n_head * N]
-    __STATIC_INLINE__ ggml_tensor* qwen_image_2_1_apply_rope(ggml_context* ctx, ggml_tensor* x, ggml_tensor* pe_table) {
+    __STATIC_INLINE__ ggml_tensor* qwen_image_2_1_apply_rope(ggml_context* ctx, ggml_tensor* x, const QwenImage21Rope& rope) {
         int64_t d_head = x->ne[0];
         int64_t n_head = x->ne[1];
         int64_t L      = x->ne[2];
         int64_t N      = x->ne[3];
+#ifndef SD_USE_UPSTREAM_GGML
+        if (rope.fused && x->type == GGML_TYPE_F32 && x->nb[0] == ggml_type_size(GGML_TYPE_F32) && rope.pe->ne[3] == L) {
+            auto x_out = ggml_rope_table(ctx, x, rope.pe, GGML_TYPE_F32);  // [N, n_head, L, d_head]
+            return ggml_reshape_3d(ctx, x_out, d_head, L, n_head * N);     // [N*n_head, L, d_head]
+        }
+#endif
+        // (the table is built per graph when the fused op is off; a q/k the op cannot take builds its own)
+        ggml_tensor* pe_table = rope.table != nullptr ? rope.table : qwen_image_2_1_rope_table(ctx, rope.pe);
         if (N == 1 && ggml_is_contiguous(x)) {
             // One copy instead of two: element (j, l, h, c) = x[2j + c, h, l], the same [d_head/2, L, n_head, 2]
             // tensor apply_rope builds with permute(0, 2, 1, 3), reshape and permute(3, 0, 1, 2).
@@ -229,8 +264,7 @@ namespace Qwen {
             return std::dynamic_pointer_cast<Linear>(blocks["to_out.0"])->deferred_output_scale(ctx);
         }
 
-        // pe: the rope table from qwen_image_2_1_rope_table
-        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* pe, const std::vector<QwenImage21Segment>& segments, const std::vector<ggml_tensor*>& masks, const QwenImage21PrefixCache& cache, bool defer_out_scale = false) {
+        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, const QwenImage21Rope& rope, const std::vector<QwenImage21Segment>& segments, const std::vector<ggml_tensor*>& masks, const QwenImage21PrefixCache& cache, bool defer_out_scale = false) {
             int64_t heads = x->ne[0] / dim_head;
             auto project  = [&](const char* name) {
                 auto h = std::dynamic_pointer_cast<Linear>(blocks[name])->forward(ctx, x);
@@ -241,8 +275,8 @@ namespace Qwen {
             auto v = project("to_v");
             q      = std::dynamic_pointer_cast<RMSNorm>(blocks["norm_q"])->forward(ctx, q);
             k      = std::dynamic_pointer_cast<RMSNorm>(blocks["norm_k"])->forward(ctx, k);
-            q      = qwen_image_2_1_apply_rope(ctx->ggml_ctx, q, pe);
-            k      = qwen_image_2_1_apply_rope(ctx->ggml_ctx, k, pe);
+            q      = qwen_image_2_1_apply_rope(ctx->ggml_ctx, q, rope);
+            k      = qwen_image_2_1_apply_rope(ctx->ggml_ctx, k, rope);
             if (cache.mode == QwenImage21PrefixCache::Mode::STORE) {
                 // Preserve query-first attention evaluation while writing each layer's
                 // prefix before its full-sequence K/V can accumulate across layers.
@@ -363,11 +397,11 @@ namespace Qwen {
 
         // attn_out_scale_folded: modulation[1] already includes the attention's deferred output scale
         // (attn_deferred_output_scale), so the attention leaves it out.
-        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, const std::vector<QwenImage21ModulationRows>& modulation, ggml_tensor* pe, const QwenImage21Layout& layout, const std::vector<ggml_tensor*>& masks, const QwenImage21PrefixCache& cache, bool attn_out_scale_folded = false) {
+        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, const std::vector<QwenImage21ModulationRows>& modulation, const QwenImage21Rope& rope, const QwenImage21Layout& layout, const std::vector<ggml_tensor*>& masks, const QwenImage21PrefixCache& cache, bool attn_out_scale_folded = false) {
             const int64_t prefix_length = cache.mode == QwenImage21PrefixCache::Mode::REUSE ? 0 : layout.prefix_length;
             auto h                      = std::dynamic_pointer_cast<LayerNorm>(blocks["img_norm1"])->forward(ctx, x);
             h                           = modulate(ctx->ggml_ctx, h, modulation[0], prefix_length);
-            h                           = std::dynamic_pointer_cast<QwenImage21Attention>(blocks["attn"])->forward(ctx, h, pe, layout.segments, masks, cache, attn_out_scale_folded);
+            h                           = std::dynamic_pointer_cast<QwenImage21Attention>(blocks["attn"])->forward(ctx, h, rope, layout.segments, masks, cache, attn_out_scale_folded);
             x                           = ggml_add(ctx->ggml_ctx, x, modulate(ctx->ggml_ctx, h, modulation[1], prefix_length));
             h                           = std::dynamic_pointer_cast<LayerNorm>(blocks["img_norm2"])->forward(ctx, x);
             h                           = modulate(ctx->ggml_ctx, h, modulation[2], prefix_length);
@@ -438,9 +472,15 @@ namespace Qwen {
                 mod_rows.push_back(QwenImage21TransformerBlock::modulation_rows(ctx, mod[i], with_prefix, i % 2 == 1,
                                                                                 i == 1 && attn_out_scale_folded ? attn_out_scale : 1.f));
             }
-            // The blocks take the rope table in qwen_image_2_1_apply_rope's layout.
-            auto pe_table = qwen_image_2_1_rope_table(ctx->ggml_ctx, pe);
-            ctx->expand_graph(pe_table);
+            // The blocks' rotary embedding: ggml_rope_table where the backend has it, else the decomposition with
+            // the table permuted once per graph.
+            QwenImage21Rope rope;
+            rope.pe    = pe;
+            rope.fused = qwen_image_2_1_rope_table_supported(ctx->ggml_ctx, ctx->backend, pe, config.head_dim, config.hidden_size / config.head_dim);
+            if (!rope.fused) {
+                rope.table = qwen_image_2_1_rope_table(ctx->ggml_ctx, pe);
+                ctx->expand_graph(rope.table);
+            }
             auto img_in        = std::dynamic_pointer_cast<Linear>(blocks["img_in"]);
             ggml_tensor* joint = nullptr;
             if (cache.mode == QwenImage21PrefixCache::Mode::REUSE) {
@@ -466,7 +506,7 @@ namespace Qwen {
                 layer_cache.name        = cache.name + "." + std::to_string(i);
                 layer_cache.cut_group   = "qwen_image_2_1." + layer;
                 auto block              = std::dynamic_pointer_cast<QwenImage21TransformerBlock>(blocks[layer]);
-                joint                   = block->forward(ctx, joint, mod_rows, pe_table, layout, masks, layer_cache, attn_out_scale_folded);
+                joint                   = block->forward(ctx, joint, mod_rows, rope, layout, masks, layer_cache, attn_out_scale_folded);
                 sd::ggml_graph_cut::mark_graph_cut(joint, layer_cache.cut_group, "joint");
             }
             if (cache.mode != QwenImage21PrefixCache::Mode::REUSE) {
