@@ -223,7 +223,8 @@ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                                     bool flash_attn       = false,
                                     float kv_scale        = 1.0f,
                                     bool sage_attn        = false,
-                                    bool* used_flash_attn = nullptr);
+                                    bool* used_flash_attn = nullptr,
+                                    bool strided_f32_v    = false);
 
 ggml_tensor* ggml_ext_layer_norm(ggml_context* ctx,
                                  ggml_tensor* x,

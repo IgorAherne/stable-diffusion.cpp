@@ -22,11 +22,12 @@ ggml_tensor* ggml_ext_attention_ext(GGMLRunnerContext* ctx,
                                     bool skip_reshape,
                                     bool flash_attn,
                                     float kv_scale,
-                                    bool* used_flash_attn) {
+                                    bool* used_flash_attn,
+                                    bool strided_f32_v) {
     if (ctx->attn_scale > 0.f) {
         kv_scale = ctx->attn_scale;
     }
-    return ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q, k, v, n_head, mask, skip_reshape, flash_attn, kv_scale, ctx->sage_attn_enabled, used_flash_attn);
+    return ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q, k, v, n_head, mask, skip_reshape, flash_attn, kv_scale, ctx->sage_attn_enabled, used_flash_attn, strided_f32_v);
 }
 
 void GGMLRunner::alloc_params_ctx() {
