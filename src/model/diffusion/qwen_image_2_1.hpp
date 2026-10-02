@@ -177,18 +177,19 @@ namespace Qwen {
     }
 
     // Rope::apply_rope (interleaved), same results. Fused: one ggml_rope_table op (no permute copies, repeats, muls
-    // and add; each product and the sum rounded to F32 on its own, so bit-identical). Otherwise the same operations as
-    // Rope::apply_rope, with the table from qwen_image_2_1_rope_table.
+    // and add; each product and the sum rounded to F32 on its own, so bit-identical), which can also give the result
+    // as F16 (type; the values ggml_cast would give). Otherwise the same operations as Rope::apply_rope, with the table
+    // from qwen_image_2_1_rope_table, and always F32: callers check the result's type.
     // x: [d_head, n_head, L, N] -> [d_head, L, n_head * N]
-    __STATIC_INLINE__ ggml_tensor* qwen_image_2_1_apply_rope(ggml_context* ctx, ggml_tensor* x, const QwenImage21Rope& rope) {
+    __STATIC_INLINE__ ggml_tensor* qwen_image_2_1_apply_rope(ggml_context* ctx, ggml_tensor* x, const QwenImage21Rope& rope, ggml_type type = GGML_TYPE_F32) {
         int64_t d_head = x->ne[0];
         int64_t n_head = x->ne[1];
         int64_t L      = x->ne[2];
         int64_t N      = x->ne[3];
 #ifndef SD_USE_UPSTREAM_GGML
         if (rope.fused && x->type == GGML_TYPE_F32 && x->nb[0] == ggml_type_size(GGML_TYPE_F32) && rope.pe->ne[3] == L) {
-            auto x_out = ggml_rope_table(ctx, x, rope.pe, GGML_TYPE_F32);  // [N, n_head, L, d_head]
-            return ggml_reshape_3d(ctx, x_out, d_head, L, n_head * N);     // [N*n_head, L, d_head]
+            auto x_out = ggml_rope_table(ctx, x, rope.pe, type);        // [N, n_head, L, d_head]
+            return ggml_reshape_3d(ctx, x_out, d_head, L, n_head * N);  // [N*n_head, L, d_head]
         }
 #endif
         // (the table is built per graph when the fused op is off; a q/k the op cannot take builds its own)
@@ -269,8 +270,8 @@ namespace Qwen {
         // blocks[norm_name] (RMSNorm) then qwen_image_2_1_apply_rope. Where the fused rope runs, one
         // ggml_rms_norm_mul_rope_table op instead (the backend's RMS_NORM + MUL arithmetic, bit-identical), unless a
         // weight adapter (LoRA) is active or the weight is not a plain F32 [d_head] tensor on the runtime backend's
-        // device (or in host memory).
-        ggml_tensor* norm_rope(GGMLRunnerContext* ctx, ggml_tensor* x, const char* norm_name, const QwenImage21Rope& rope) {
+        // device (or in host memory). type: F16 asks the fused op for an F16 result (F32 when it cannot run).
+        ggml_tensor* norm_rope(GGMLRunnerContext* ctx, ggml_tensor* x, const char* norm_name, const QwenImage21Rope& rope, ggml_type type = GGML_TYPE_F32) {
             auto norm = std::dynamic_pointer_cast<RMSNorm>(blocks[norm_name]);
 #ifndef SD_USE_UPSTREAM_GGML
             ggml_tensor* w = norm->unpatched_weight();
@@ -282,13 +283,13 @@ namespace Qwen {
             if (rope.fused && typeid(*norm) == typeid(RMSNorm) && ctx->weight_adapter == nullptr && w != nullptr && w->type == GGML_TYPE_F32 &&
                 ggml_is_contiguous(w) && ggml_nelements(w) == x->ne[0] && on_runtime_device(w) &&
                 x->type == GGML_TYPE_F32 && x->nb[0] == ggml_type_size(GGML_TYPE_F32) && rope.pe->ne[3] == x->ne[2]) {
-                auto out = ggml_rms_norm_mul_rope_table(ctx->ggml_ctx, x, w, norm->get_eps(), rope.pe, GGML_TYPE_F32);
+                auto out = ggml_rms_norm_mul_rope_table(ctx->ggml_ctx, x, w, norm->get_eps(), rope.pe, type);
                 if (ggml_backend_supports_op(ctx->backend, out)) {
                     return ggml_reshape_3d(ctx->ggml_ctx, out, x->ne[0], x->ne[2], x->ne[1] * x->ne[3]);  // [N*n_head, L, d_head]
                 }
             }
 #endif
-            return qwen_image_2_1_apply_rope(ctx->ggml_ctx, norm->forward(ctx, x), rope);
+            return qwen_image_2_1_apply_rope(ctx->ggml_ctx, norm->forward(ctx, x), rope, type);
         }
 
         ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, const QwenImage21Rope& rope, const std::vector<QwenImage21Segment>& segments, const std::vector<ggml_tensor*>& masks, const QwenImage21PrefixCache& cache, bool defer_out_scale = false) {
@@ -301,7 +302,15 @@ namespace Qwen {
             auto k = project("to_k");
             auto v = project("to_v");
             q      = norm_rope(ctx, q, "norm_q", rope);
-            k      = norm_rope(ctx, k, "norm_k", rope);
+            // Prefix-cache REUSE with flash attention: K straight from the RoPE op in F16, the values the attention's
+            // F32 -> F16 cast would give, so the concat with the prefix runs in F16 and that cast goes away
+            // (cast(concat(a, b)) == concat(cast(a), cast(b)) element by element). Not with an attention scale
+            // override (it would scale the F16 values) or sage attention (it takes F32 K); if flash attention does not
+            // end up taking K, the F32 path below is built instead.
+            auto k_proj        = k;
+            const bool k_f16   = cache.mode == QwenImage21PrefixCache::Mode::REUSE && rope.fused && ctx->flash_attn_enabled &&
+                                 !ctx->sage_attn_enabled && !(ctx->attn_scale > 0.f);
+            k                  = norm_rope(ctx, k_proj, "norm_k", rope, k_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32);
             if (cache.mode == QwenImage21PrefixCache::Mode::STORE) {
                 // Preserve query-first attention evaluation while writing each layer's
                 // prefix before its full-sequence K/V can accumulate across layers.
@@ -320,10 +329,16 @@ namespace Qwen {
                 persist(k, 1, "k");
                 persist(v, 2, "v");
             }
-            auto attend = [&](ggml_tensor* aq, ggml_tensor* ak, ggml_tensor* av, ggml_tensor* mask) {
+            auto attend = [&](ggml_tensor* aq, ggml_tensor* ak, ggml_tensor* av, ggml_tensor* mask, bool* used = nullptr) {
                 bool used_flash_attn = false;
                 // strided_f32_v: on CUDA, flash attention converts the permuted F32 V view to F16 itself.
                 auto out             = ggml_ext_attention_ext(ctx, aq, ak, av, heads, mask, true, ctx->flash_attn_enabled, 1.f, &used_flash_attn, true);
+                if (used != nullptr) {
+                    *used = used_flash_attn;
+                    if (!used_flash_attn) {
+                        return out;  // the caller retries; its result decides
+                    }
+                }
                 if (cache.flash_attn_used != nullptr) {
                     *cache.flash_attn_used &= used_flash_attn;
                 }
@@ -331,20 +346,43 @@ namespace Qwen {
             };
             ggml_tensor* result = nullptr;
             if (cache.mode == QwenImage21PrefixCache::Mode::REUSE) {
-                auto prefix_k = ctx->load_cache_tensor(cache.name + ".k");
-                auto prefix_v = ctx->load_cache_tensor(cache.name + ".v");
-                GGML_ASSERT(prefix_k != nullptr && prefix_v != nullptr);
-                if (prefix_k->type != k->type) {
-                    prefix_k = ggml_cast(ctx->ggml_ctx, prefix_k, k->type);
-                }
+                auto prefix_k_cache = ctx->load_cache_tensor(cache.name + ".k");
+                auto prefix_v       = ctx->load_cache_tensor(cache.name + ".v");
+                GGML_ASSERT(prefix_k_cache != nullptr && prefix_v != nullptr);
                 if (prefix_v->type != v->type) {
                     prefix_v = ggml_cast(ctx->ggml_ctx, prefix_v, v->type);
                 }
-                prefix_k = ggml_reshape_4d(ctx->ggml_ctx, prefix_k, dim_head, cache.prefix_length, heads, k->ne[3]);
                 prefix_v = ggml_reshape_4d(ctx->ggml_ctx, prefix_v, dim_head, heads, cache.prefix_length, v->ne[3]);
-                k        = ggml_concat(ctx->ggml_ctx, prefix_k, k, 1);
                 v        = ggml_concat(ctx->ggml_ctx, prefix_v, v, 2);
-                result   = attend(q, k, v, nullptr);
+                if (k->type == GGML_TYPE_F16) {
+                    // the prefix's values as the F32 path gets them (cache type -> F32), then -> F16 like its cast
+                    auto prefix_k = prefix_k_cache;
+                    if (prefix_k->type != GGML_TYPE_F16) {
+                        if (prefix_k->type != GGML_TYPE_F32) {
+                            prefix_k = ggml_cast(ctx->ggml_ctx, prefix_k, GGML_TYPE_F32);
+                        }
+                        prefix_k = ggml_cast(ctx->ggml_ctx, prefix_k, GGML_TYPE_F16);
+                    }
+                    prefix_k     = ggml_reshape_4d(ctx->ggml_ctx, prefix_k, dim_head, cache.prefix_length, heads, k->ne[3]);
+                    auto k_all   = ggml_concat(ctx->ggml_ctx, prefix_k, k, 1);
+                    bool used_fa = false;
+                    if (ggml_backend_supports_op(ctx->backend, k_all)) {
+                        result = attend(q, k_all, v, nullptr, &used_fa);
+                    }
+                    if (!used_fa) {
+                        result = nullptr;
+                        k      = norm_rope(ctx, k_proj, "norm_k", rope);  // F32
+                    }
+                }
+                if (result == nullptr) {
+                    auto prefix_k = prefix_k_cache;
+                    if (prefix_k->type != k->type) {
+                        prefix_k = ggml_cast(ctx->ggml_ctx, prefix_k, k->type);
+                    }
+                    prefix_k = ggml_reshape_4d(ctx->ggml_ctx, prefix_k, dim_head, cache.prefix_length, heads, k->ne[3]);
+                    k        = ggml_concat(ctx->ggml_ctx, prefix_k, k, 1);
+                    result   = attend(q, k, v, nullptr);
+                }
             } else {
                 for (size_t i = 0; i < segments.size(); ++i) {
                     const auto& segment = segments[i];

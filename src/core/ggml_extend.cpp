@@ -692,7 +692,9 @@ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
         if (kv_scale != 1.0f) {
             k_in = ggml_ext_scale(ctx, k_in, kv_scale);
         }
-        k_in = ggml_cast(ctx, k_in, GGML_TYPE_F16);
+        if (k_in->type != GGML_TYPE_F16) {  // an F16 K (e.g. Qwen-Image 2.1's) goes in as it is, not through a copy
+            k_in = ggml_cast(ctx, k_in, GGML_TYPE_F16);
+        }
 
         if (strided_f32_v && !pad_head && kv_scale == 1.0f && N == 1 && v_in->type == GGML_TYPE_F32 &&
             v_in->nb[0] == ggml_type_size(GGML_TYPE_F32) && sd_backend_supports_cuda_mma(backend)) {
