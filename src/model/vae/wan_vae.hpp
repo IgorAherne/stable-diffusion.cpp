@@ -147,14 +147,25 @@ namespace WAN {
         using Conv2d::Conv2d;
 
         ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) {
-            ggml_tensor* x_swapped = ggml_permute(ctx->ggml_ctx, x, 0, 1, 3, 2);
-            x_swapped              = ggml_cont(ctx->ggml_ctx, x_swapped);
+            // swapping dims 2 and 3 of a contiguous tensor with a single frame (ne[2] == 1) moves no data: a reshape
+            // gives the same tensor without the copy
+            ggml_tensor* x_swapped;
+            if (x->ne[2] == 1 && ggml_is_contiguous(x)) {
+                x_swapped = ggml_reshape_4d(ctx->ggml_ctx, x, x->ne[0], x->ne[1], x->ne[3], 1);
+            } else {
+                x_swapped = ggml_permute(ctx->ggml_ctx, x, 0, 1, 3, 2);
+                x_swapped = ggml_cont(ctx->ggml_ctx, x_swapped);
+            }
 
             ggml_tensor* out = Conv2d::forward(ctx, x_swapped);
 
-            ggml_tensor* out_swapped = ggml_permute(ctx->ggml_ctx, out, 0, 1, 3, 2);
-
-            out_swapped = ggml_cont(ctx->ggml_ctx, out_swapped);
+            ggml_tensor* out_swapped;
+            if (out->ne[3] == 1 && ggml_is_contiguous(out)) {
+                out_swapped = ggml_reshape_4d(ctx->ggml_ctx, out, out->ne[0], out->ne[1], 1, out->ne[2]);
+            } else {
+                out_swapped = ggml_permute(ctx->ggml_ctx, out, 0, 1, 3, 2);
+                out_swapped = ggml_cont(ctx->ggml_ctx, out_swapped);
+            }
 
             return out_swapped;
         }

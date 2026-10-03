@@ -415,6 +415,28 @@ ggml_tensor* ggml_ext_conv_1d(ggml_context* ctx,
     return result;
 }
 
+// ggml_conv_2d (im2col + mul_mat), without its final copy when there is one image (N == 1): its permute then only
+// moves a size-1 dim, so a reshape of the product is the same tensor
+static ggml_tensor* ggml_ext_conv_2d_im2col(ggml_context* ctx,
+                                           ggml_tensor* w,
+                                           ggml_tensor* x,
+                                           int s0,
+                                           int s1,
+                                           int p0,
+                                           int p1,
+                                           int d0,
+                                           int d1) {
+    if (x->ne[3] != 1) {
+        return ggml_conv_2d(ctx, w, x, s0, s1, p0, p1, d0, d1);
+    }
+    ggml_tensor* im2col = ggml_im2col(ctx, w, x, s0, s1, p0, p1, d0, d1, true,
+                                      w->type == GGML_TYPE_BF16 ? GGML_TYPE_F32 : GGML_TYPE_F16);  // [N, OH, OW, IC * KH * KW]
+    ggml_tensor* result = ggml_mul_mat(ctx,
+                                       ggml_reshape_2d(ctx, im2col, im2col->ne[0], im2col->ne[3] * im2col->ne[2] * im2col->ne[1]),
+                                       ggml_reshape_2d(ctx, w, (w->ne[0] * w->ne[1] * w->ne[2]), w->ne[3]));
+    return ggml_reshape_4d(ctx, result, im2col->ne[1], im2col->ne[2], w->ne[3], 1);  // [N = 1, OC, OH, OW]
+}
+
 ggml_tensor* ggml_ext_conv_2d(ggml_context* ctx,
                               ggml_tensor* x,
                               ggml_tensor* w,
@@ -445,7 +467,7 @@ ggml_tensor* ggml_ext_conv_2d(ggml_context* ctx,
     if (direct) {
         x = ggml_conv_2d_direct(ctx, w, x, s0, s1, p0, p1, d0, d1);
     } else {
-        x = ggml_conv_2d(ctx, w, x, s0, s1, p0, p1, d0, d1);
+        x = ggml_ext_conv_2d_im2col(ctx, w, x, s0, s1, p0, p1, d0, d1);
     }
     if (scale != 1.f) {
         x = ggml_ext_scale(ctx, x, 1.f / scale);
