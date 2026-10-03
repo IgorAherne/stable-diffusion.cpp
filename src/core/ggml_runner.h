@@ -109,6 +109,17 @@ struct GGMLRunnerContext {
         }
     }
 
+    // Keeps `tensor` allocated until the nodes added to the graph so far have run: appends a no-op node (op NONE, a
+    // view of `tensor` reading it, like ggml_backend_sched's allocation dependencies) that the graph allocator counts
+    // as a use of it and that the backends skip. For a backend that fuses a later node with ops reading `tensor`.
+    void keep_allocated(ggml_tensor* tensor) const {
+        if (graph != nullptr && tensor != nullptr) {
+            ggml_tensor* dep = ggml_view_tensor(ggml_ctx, tensor);
+            dep->src[0]      = tensor;
+            ggml_graph_add_node(graph, dep);
+        }
+    }
+
     void persist_cache_tensor(const std::string& name, ggml_tensor* tensor) const {
         if (!cache_tensor || tensor == nullptr) {
             return;

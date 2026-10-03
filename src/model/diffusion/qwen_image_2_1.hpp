@@ -379,6 +379,16 @@ namespace Qwen {
                     if (ggml_backend_supports_op(ctx->backend, k_all) && ggml_backend_supports_op(ctx->backend, v_all)) {
                         result = attend(q, k_all, v_all, nullptr, &used_fa);
                     }
+                    if (used_fa) {
+                        // The concats into the graph now, each followed by a node keeping its RoPE / cast input
+                        // allocated past it: the CUDA backend then writes K's RoPE and V's cast straight into the
+                        // concats' outputs (whose memory could otherwise be their just-freed inputs) instead of
+                        // copying them there. Same values; only the order of independent nodes changes.
+                        ctx->expand_graph(k_all);
+                        ctx->keep_allocated(k_proj);
+                        ctx->expand_graph(v_all);
+                        ctx->keep_allocated(v);
+                    }
                     if (!used_fa) {
                         result = nullptr;
                         k      = norm_rope(ctx, k_proj, "norm_k", rope);  // F32
