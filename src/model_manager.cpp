@@ -1,7 +1,9 @@
 #include "model_manager.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
+#include <cstdlib>
 #include <iterator>
 #include <mutex>
 #include <tuple>
@@ -53,6 +55,49 @@ static bool backend_supports_host_buffer(ggml_backend_t backend) {
     ggml_backend_dev_props props;
     ggml_backend_dev_get_props(dev, &props);
     return props.caps.buffer_from_host_ptr;
+}
+
+// SD_PIN_PARAMS: comma-separated components ("diffusion", "text_encoder", "vae", "all") whose params,
+// when they are kept in RAM and copied to a GPU for computing, live in that GPU's page-locked host
+// buffers instead of the model file's mapping (params_buffer_type_for picks that buffer type for them).
+// Their copies to the card then run at full DMA speed, and the system cannot page them out between
+// uses; the cost is that much RAM locked for as long as the model stays loaded.
+static const std::set<ModelComponent>& pinned_param_components() {
+    static const std::set<ModelComponent> components = [] {
+        std::set<ModelComponent> result;
+        const char* value = std::getenv("SD_PIN_PARAMS");
+        if (value == nullptr || *value == '\0') {
+            return result;
+        }
+        for (const std::string& token : split_string(value, ',')) {
+            std::string name = trim(token);
+            std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+            if (name == "diffusion" || name == "all") {
+                result.insert(ModelComponent::Diffusion);
+                result.insert(ModelComponent::HighNoiseDiffusion);
+            }
+            if (name == "text_encoder" || name == "all") {
+                result.insert(ModelComponent::Conditioner);
+            }
+            if (name == "vae" || name == "all") {
+                result.insert(ModelComponent::VAE);
+            }
+            if (name != "diffusion" && name != "text_encoder" && name != "vae" && name != "all" && !name.empty()) {
+                LOG_WARN("SD_PIN_PARAMS: unknown component '%s' ignored (diffusion, text_encoder, vae, all)",
+                         name.c_str());
+            }
+        }
+        return result;
+    }();
+    return components;
+}
+
+static bool is_pinned_host_buffer_type(ggml_backend_buffer_type_t buft) {
+    if (buft == nullptr || !ggml_backend_buft_is_host(buft)) {
+        return false;
+    }
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    return dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
 }
 
 static bool device_supports_param_op(ggml_backend_dev_t device,
@@ -860,6 +905,13 @@ bool ModelManager::can_mmap_storage(const TensorState& state) const {
     if (state.compute_backend == nullptr || state.params_backend == nullptr) {
         return false;
     }
+    if (state.usage_op == GGML_OP_NONE && pinned_param_components().count(state.component) > 0 &&
+        sd_backend_is_cpu(state.params_backend) && !sd_backend_is_cpu(state.compute_backend)) {
+        ggml_backend_dev_t compute_dev = ggml_backend_get_device(state.compute_backend);
+        if (compute_dev != nullptr && is_pinned_host_buffer_type(ggml_backend_dev_host_buffer_type(compute_dev))) {
+            return false;  // SD_PIN_PARAMS: loaded into the GPU's page-locked host buffers instead
+        }
+    }
     return sd_backend_is_cpu(state.compute_backend) ||
            sd_backend_is_cpu(state.params_backend) ||
            backend_supports_host_buffer(state.compute_backend);
@@ -884,10 +936,15 @@ bool ModelManager::alloc_params_buffers(const std::vector<TensorState*>& states,
         const std::vector<TensorState*>& states = pair.second;
         size_t alignment                        = ggml_backend_buft_get_alignment(params_buft);
         size_t max_size                         = ggml_backend_buft_get_max_size(params_buft);
-        if (!ggml_backend_buft_is_host(params_buft) &&
+        // Page-locked host memory is allocated in blocks of at most 1 GiB as well: a GPU's host buffer
+        // type falls back to pageable RAM when the system refuses to lock a range, and with smaller
+        // blocks only the refused ones do.
+        const bool pinned_host = is_pinned_host_buffer_type(params_buft);
+        if ((!ggml_backend_buft_is_host(params_buft) || pinned_host) &&
             (max_size == 0 || max_size > MAX_RESIDENCY_BLOCK_BYTES)) {
             max_size = MAX_RESIDENCY_BLOCK_BYTES;
         }
+        std::map<ModelComponent, std::pair<size_t, size_t>> pinned_bytes;  // component -> {locked, refused}
 
         auto alloc_chunk = [&](const std::vector<TensorState*>& chunk, size_t chunk_size) -> bool {
             if (chunk.empty() || chunk_size == 0) {
@@ -899,6 +956,21 @@ bool ModelManager::alloc_params_buffers(const std::vector<TensorState*>& states,
                 LOG_ERROR("model manager alloc params backend buffer failed, size = %.2fMB",
                           chunk_size / (1024.0 * 1024.0));
                 return false;
+            }
+            if (pinned_host) {
+                const bool locked = ggml_backend_buffer_get_type(buffer) == params_buft;
+                for (TensorState* state : chunk) {
+                    size_t size = GGML_PAD(ggml_backend_buft_get_alloc_size(params_buft, state->tensor), alignment);
+                    (locked ? pinned_bytes[state->component].first : pinned_bytes[state->component].second) += size;
+                }
+                if (!locked) {
+                    LOG_WARN(
+                        "%s: could not page-lock %.2f MB of params (%s refused it); they stay in pageable RAM, "
+                        "so their copies to the GPU are slower",
+                        model_component_name(chunk.front()->component),
+                        chunk_size / (1024.0 * 1024.0),
+                        ggml_backend_buft_name(params_buft));
+                }
             }
             ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
@@ -959,6 +1031,16 @@ bool ModelManager::alloc_params_buffers(const std::vector<TensorState*>& states,
         if (!alloc_chunk(chunk, chunk_size)) {
             return false;
         }
+        for (const auto& entry : pinned_bytes) {
+            if (pinned_param_components().count(entry.first) == 0) {
+                continue;  // pinned anyway (params that cannot be mapped): only the verbose summary reports them
+            }
+            LOG_INFO("%s params: %.2f MB in page-locked host memory (%s)%s",
+                     model_component_name(entry.first),
+                     entry.second.first / (1024.0 * 1024.0),
+                     ggml_backend_buft_name(params_buft),
+                     entry.second.second == 0 ? "" : ", the rest in pageable RAM (see the warnings above)");
+        }
     }
 
     return true;
@@ -1006,9 +1088,11 @@ bool ModelManager::load_tensor_parts(TensorState& state) {
         }
         return true;
     };
-    const bool success = state.source_file == 0
-                             ? model_loader_.load_tensors(callback, enable_mmap_, &names, false)
-                             : model_loader_.load_file_tensors(state.source_file, state.source_version, callback, names, enable_mmap_);
+    // SD_PIN_PARAMS: read from the file, not through its mapping (see load_tensors)
+    const std::set<std::string>* read_from_file = pinned_param_components().count(state.component) > 0 ? &names : nullptr;
+    const bool success                          = state.source_file == 0
+                                                      ? model_loader_.load_tensors(callback, enable_mmap_, &names, false, read_from_file)
+                                                      : model_loader_.load_file_tensors(state.source_file, state.source_version, callback, names, enable_mmap_);
     if (!success || loaded != names) {
         return false;
     }
@@ -1049,9 +1133,17 @@ bool ModelManager::load_tensors(const std::vector<TensorState*>& states) {
         for (auto& batch : group.second) {
             std::set<std::string> names;
             std::set<std::string> loaded;
+            // SD_PIN_PARAMS: pinned params are read from the file, not through its mapping, so the
+            // mapping's pages do not join the process's working set next to the pinned copy (the
+            // same weights would then take RAM twice).
+            std::set<std::string> read_from_file;
             std::mutex mutex;
-            for (const auto& entry : batch)
+            for (const auto& entry : batch) {
                 names.insert(entry.first);
+                if (pinned_param_components().count(entry.second.front()->component) > 0) {
+                    read_from_file.insert(entry.first);
+                }
+            }
             auto callback = [&](const TensorStorage& source, ggml_tensor** dst) {
                 *dst       = nullptr;
                 auto found = batch.find(source.name);
@@ -1063,7 +1155,7 @@ bool ModelManager::load_tensors(const std::vector<TensorState*>& states) {
                 return true;
             };
             const auto file = group.first.first;
-            bool success    = file == 0 ? model_loader_.load_tensors(callback, enable_mmap_, &names)
+            bool success    = file == 0 ? model_loader_.load_tensors(callback, enable_mmap_, &names, true, &read_from_file)
                                         : model_loader_.load_file_tensors(file, group.first.second, callback, names, enable_mmap_);
             if (!success || loaded != names)
                 return false;

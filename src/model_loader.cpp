@@ -1042,7 +1042,8 @@ std::vector<ggml_backend_buffer_t> ModelLoader::get_device_mmap_buffers() const 
 bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
                                bool enable_mmap,
                                const std::set<std::string>* target_tensor_names,
-                               bool log_progress) {
+                               bool log_progress,
+                               const std::set<std::string>* read_from_file) {
     if (!validate_sources(target_tensor_names)) {
         return false;
     }
@@ -1114,6 +1115,12 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
         bool is_zip = fdata.is_zip;
 
         std::shared_ptr<MmapWrapper> mmapped = fdata.mmapped;
+        bool file_reads                      = !mmapped;  // read_from_file tensors need the file too
+        if (read_from_file != nullptr) {
+            for (const TensorStorage* tensor_storage : tensors_to_process) {
+                file_reads = file_reads || read_from_file->count(tensor_storage->name) > 0;
+            }
+        }
 
         int n_threads = is_zip ? 1 : std::min(num_threads_to_use, (int)tensors_to_process.size());
         if (n_threads < 1) {
@@ -1137,7 +1144,7 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
                         failed = true;
                         return;
                     }
-                } else if (!mmapped) {
+                } else if (file_reads) {
                     file.open(file_path, std::ios::binary);
                     if (!file.is_open()) {
                         LOG_ERROR("failed to open '%s'", file_path.c_str());
@@ -1232,7 +1239,7 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
                                 }
                             }
                             zip_entry_close(zip);
-                        } else if (mmapped) {
+                        } else if (mmapped && (read_from_file == nullptr || read_from_file->count(tensor_storage.name) == 0)) {
                             if (!mmapped->copy_data(buf, n, tensor_storage.offset)) {
                                 LOG_ERROR("read tensor data failed: '%s'", file_path.c_str());
                                 return false;

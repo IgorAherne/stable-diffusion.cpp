@@ -125,10 +125,13 @@ public:
                                               bool writable                        = true,
                                               ggml_backend_dev_t device            = nullptr);
     std::vector<ggml_backend_buffer_t> get_device_mmap_buffers() const;
+    // read_from_file: tensors read with file reads even when their file is mapped, so that copying them
+    // into buffers of their own does not pull the mapping's pages into the process's working set.
     bool load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
                       bool use_mmap                                    = false,
                       const std::set<std::string>* target_tensor_names = nullptr,
-                      bool log_progress                                = true);
+                      bool log_progress                                = true,
+                      const std::set<std::string>* read_from_file      = nullptr);
     bool load_tensors(std::map<std::string, ggml_tensor*>& tensors,
                       std::set<std::string> ignore_tensors = {},
                       bool use_mmap                        = false);
