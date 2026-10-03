@@ -220,7 +220,7 @@ namespace Qwen {
         auto pe_1 = ggml_view_3d(ctx, pe_table, pe_table->ne[0], pe_table->ne[1], pe_table->ne[2], pe_table->nb[1], pe_table->nb[2], offset * 1);  // [L, d_head/2, 2]
 
         auto x_out = ggml_add_inplace(ctx, ggml_mul(ctx, x_0, pe_0), ggml_mul(ctx, x_1, pe_1));  // [N * n_head, L, d_head/2, 2]
-        return ggml_reshape_3d(ctx, x_out, d_head, L, n_head * N);                                // [N*n_head, L, d_head]
+        return ggml_reshape_3d(ctx, x_out, d_head, L, n_head * N);                               // [N*n_head, L, d_head]
     }
 
     class QwenImage21ZeroCenterRMSNorm : public RMSNorm {
@@ -275,7 +275,7 @@ namespace Qwen {
         ggml_tensor* norm_rope(GGMLRunnerContext* ctx, ggml_tensor* x, const char* norm_name, const QwenImage21Rope& rope, ggml_type type = GGML_TYPE_F32) {
             auto norm = std::dynamic_pointer_cast<RMSNorm>(blocks[norm_name]);
 #ifndef SD_USE_UPSTREAM_GGML
-            ggml_tensor* w = norm->unpatched_weight();
+            ggml_tensor* w         = norm->unpatched_weight();
             auto on_runtime_device = [&](ggml_tensor* t) {
                 return t->buffer == nullptr || ggml_backend_buffer_is_host(t->buffer) ||
                        ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer)) == ggml_backend_get_device(ctx->backend);
@@ -315,10 +315,10 @@ namespace Qwen {
             // (cast(concat(a, b)) == concat(cast(a), cast(b)) element by element). Not with an attention scale
             // override (it would scale the F16 values) or sage attention (it takes F32 K); if flash attention does not
             // end up taking K, the F32 path below is built instead.
-            auto k_proj        = k;
-            const bool k_f16   = cache.mode == QwenImage21PrefixCache::Mode::REUSE && rope.fused && ctx->flash_attn_enabled &&
-                                 !ctx->sage_attn_enabled && !(ctx->attn_scale > 0.f);
-            k                  = norm_rope(ctx, k_proj, "norm_k", rope, k_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32);
+            auto k_proj      = k;
+            const bool k_f16 = cache.mode == QwenImage21PrefixCache::Mode::REUSE && rope.fused && ctx->flash_attn_enabled &&
+                               !ctx->sage_attn_enabled && !(ctx->attn_scale > 0.f);
+            k = norm_rope(ctx, k_proj, "norm_k", rope, k_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32);
             if (cache.mode == QwenImage21PrefixCache::Mode::STORE) {
                 // Preserve query-first attention evaluation while writing each layer's
                 // prefix before its full-sequence K/V can accumulate across layers.
@@ -340,7 +340,7 @@ namespace Qwen {
             auto attend = [&](ggml_tensor* aq, ggml_tensor* ak, ggml_tensor* av, ggml_tensor* mask, bool* used = nullptr) {
                 bool used_flash_attn = false;
                 // strided_f32_v: on CUDA, flash attention converts the permuted F32 V view to F16 itself.
-                auto out             = ggml_ext_attention_ext(ctx, aq, ak, av, heads, mask, true, ctx->flash_attn_enabled, 1.f, &used_flash_attn, true);
+                auto out = ggml_ext_attention_ext(ctx, aq, ak, av, heads, mask, true, ctx->flash_attn_enabled, 1.f, &used_flash_attn, true);
                 if (used != nullptr) {
                     *used = used_flash_attn;
                     if (!used_flash_attn) {
@@ -484,7 +484,7 @@ namespace Qwen {
             x                           = ggml_add(ctx->ggml_ctx, x, modulate(ctx->ggml_ctx, h, modulation[1], prefix_length));
             h                           = std::dynamic_pointer_cast<LayerNorm>(blocks["img_norm2"])->forward(ctx, x);
             h                           = modulate(ctx->ggml_ctx, h, modulation[2], prefix_length);
-            auto fused = blocks.find("img_mlp.gate_up");
+            auto fused                  = blocks.find("img_mlp.gate_up");
             if (fused != blocks.end()) {
                 auto gate_up = std::dynamic_pointer_cast<Linear>(fused->second)->forward(ctx, h);
                 // gate_up = [gate | up] along ne0. ggml_swiglu (not swapped) computes silu(first half) * second half
@@ -528,11 +528,11 @@ namespace Qwen {
         ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* timestep, ggml_tensor* context, const std::vector<ggml_tensor*>& refs, ggml_tensor* pe, const QwenImage21Layout& layout, const std::vector<ggml_tensor*>& masks, const QwenImage21PrefixCache& cache) {
             auto time = ggml_concat(ctx->ggml_ctx, timestep, ggml_ext_zeros_like(ctx->ggml_ctx, timestep), 0);
             // Runtime flow timesteps already use the [0, 1000] scale.
-            time               = ggml_ext_timestep_embedding(ctx->ggml_ctx, time, 256, 10000, 1.f);
-            time               = std::dynamic_pointer_cast<TimestepEmbedding>(blocks["time_text_embed.timestep_embedder"])->forward(ctx, time);
-            time               = ggml_silu(ctx->ggml_ctx, time);
-            auto modulation    = std::dynamic_pointer_cast<Linear>(blocks["modulation.1"])->forward(ctx, time);
-            auto mod           = ggml_ext_chunk(ctx->ggml_ctx, modulation, 4, 0);
+            time            = ggml_ext_timestep_embedding(ctx->ggml_ctx, time, 256, 10000, 1.f);
+            time            = std::dynamic_pointer_cast<TimestepEmbedding>(blocks["time_text_embed.timestep_embedder"])->forward(ctx, time);
+            time            = ggml_silu(ctx->ggml_ctx, time);
+            auto modulation = std::dynamic_pointer_cast<Linear>(blocks["modulation.1"])->forward(ctx, time);
+            auto mod        = ggml_ext_chunk(ctx->ggml_ctx, modulation, 4, 0);
             // Chunks 0 and 2 scale the normed tokens (1 + scale), 1 and 3 gate the residual branches (tanh).
             const bool with_prefix = cache.mode != QwenImage21PrefixCache::Mode::REUSE && layout.prefix_length > 0;
             // Each attention's to_out scales its input by 1/32 and its output back by 32 (against NaN with k-quants).
@@ -541,8 +541,8 @@ namespace Qwen {
             // so the rounded results are identical, and one 64 MiB scale per layer goes away.
             float attn_out_scale = 0.f;
             for (int i = 0; i < config.num_layers; ++i) {
-                auto block    = std::dynamic_pointer_cast<QwenImage21TransformerBlock>(blocks["transformer_blocks." + std::to_string(i)]);
-                const float f = block->attn_deferred_output_scale(ctx);
+                auto block     = std::dynamic_pointer_cast<QwenImage21TransformerBlock>(blocks["transformer_blocks." + std::to_string(i)]);
+                const float f  = block->attn_deferred_output_scale(ctx);
                 attn_out_scale = (attn_out_scale == 0.f || attn_out_scale == f) ? f : 1.f;
             }
             const bool attn_out_scale_folded = attn_out_scale != 0.f && attn_out_scale != 1.f;
@@ -774,7 +774,7 @@ namespace Qwen {
                     }
                 }
                 if (table == nullptr) {
-                    table = &rope_tables[next_rope_table];
+                    table           = &rope_tables[next_rope_table];
                     next_rope_table = (next_rope_table + 1) % rope_tables.size();
                     table->key.clear();
                     Rope::Embedding embedding;
