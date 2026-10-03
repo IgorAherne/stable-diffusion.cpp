@@ -1,6 +1,7 @@
 #ifndef __SD_MODEL_DIFFUSION_QWEN_IMAGE_2_1_H__
 #define __SD_MODEL_DIFFUSION_QWEN_IMAGE_2_1_H__
 
+#include <array>
 #include <typeinfo>
 
 #include "model/diffusion/qwen_image.hpp"
@@ -594,7 +595,14 @@ namespace Qwen {
     struct QwenImage21Runner : public DiffusionModelRunner {
         QwenImage21Config config;
         QwenImage21Model model;
-        std::vector<float> pe_data;
+        // Rotary tables already computed, by everything they were computed from (see compute): one per prompt layout
+        // and prefix-cache mode (cond / uncond x STORE / REUSE), reused round-robin.
+        struct RopeTable {
+            std::vector<double> key;
+            std::vector<float> values;
+        };
+        std::array<RopeTable, 4> rope_tables;
+        size_t next_rope_table = 0;
         std::vector<sd::Tensor<float>> mask_data;
         ggml_type prefix_cache_type = GGML_TYPE_COUNT;
         bool prefix_cache_enabled   = true;
@@ -728,18 +736,49 @@ namespace Qwen {
                 }
                 const bool cached         = active_cache.mode == QwenImage21PrefixCache::Mode::REUSE;
                 const auto first_position = layout.positions.begin() + (cached ? layout.prefix_length : 0);
-                Rope::Embedding embedding;
-                embedding.ids.assign(first_position, layout.positions.end());
-                const size_t offset             = cached ? static_cast<size_t>(layout.prefix_length) : 0;
-                embedding.positions.token_count = embedding.ids.size();
+                const size_t offset       = cached ? static_cast<size_t>(layout.prefix_length) : 0;
+                std::vector<Rope::SpatialRegion> regions;
                 for (auto region : layout.rope_layout.images) {
                     if (region.begin >= offset) {
                         region.begin -= offset;
-                        embedding.positions.images.push_back(region);
+                        regions.push_back(region);
                     }
                 }
-                embedding.values = Rope::embed_nd(embedding.ids, 1, 10000.f, config.axes_dim, embedding.layout, &embedding.frequencies);
-                pe_data          = finish_rope_pe(std::move(embedding));
+                // The rotary table depends only on the token positions, the image regions and the circular flags,
+                // which stay the same for every step of a sampling run (and for every picture of the same prompt
+                // layout): compute it once per such key (~7 ms of CPU work per forward, during which the GPU sat
+                // idle) instead of once per forward. Same values: the same computation on the same inputs.
+                // (a double holds every float, size and flag here exactly)
+                std::vector<double> key = {static_cast<double>(circular_x_enabled), static_cast<double>(circular_y_enabled),
+                                           static_cast<double>(regions.size()), static_cast<double>(layout.positions.end() - first_position)};
+                for (const auto& region : regions) {
+                    key.insert(key.end(), {static_cast<double>(region.begin), static_cast<double>(region.count), region.height_period,
+                                           region.width_period, static_cast<double>(region.height_axis), static_cast<double>(region.width_axis)});
+                }
+                for (auto it = first_position; it != layout.positions.end(); ++it) {
+                    key.push_back(static_cast<double>(it->size()));
+                    key.insert(key.end(), it->begin(), it->end());
+                }
+                RopeTable* table = nullptr;
+                for (auto& candidate : rope_tables) {
+                    if (!candidate.values.empty() && candidate.key == key) {
+                        table = &candidate;
+                        break;
+                    }
+                }
+                if (table == nullptr) {
+                    table = &rope_tables[next_rope_table];
+                    next_rope_table = (next_rope_table + 1) % rope_tables.size();
+                    table->key.clear();
+                    Rope::Embedding embedding;
+                    embedding.ids.assign(first_position, layout.positions.end());
+                    embedding.positions.token_count = embedding.ids.size();
+                    embedding.positions.images      = regions;
+                    embedding.values                = Rope::embed_nd(embedding.ids, 1, 10000.f, config.axes_dim, embedding.layout, &embedding.frequencies);
+                    table->values                   = finish_rope_pe(std::move(embedding));
+                    table->key                      = std::move(key);
+                }
+                const std::vector<float>& pe_data = table->values;
                 mask_data.clear();
                 if (!cached) {
                     for (const auto& segment : layout.segments) {
