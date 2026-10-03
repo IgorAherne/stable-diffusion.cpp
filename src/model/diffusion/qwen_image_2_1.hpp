@@ -297,6 +297,13 @@ namespace Qwen {
             int64_t heads = x->ne[0] / dim_head;
             auto project  = [&](const char* name) {
                 auto h = std::dynamic_pointer_cast<Linear>(blocks[name])->forward(ctx, x);
+                if (cache.mode == QwenImage21PrefixCache::Mode::REUSE) {
+                    // q, k and v's matmuls one after the other in the graph (instead of each next to its own RoPE
+                    // and concat): the CUDA backend then quantizes their shared input once for all three. Same
+                    // values. Only in REUSE: keeping all three projections alive at once raises the graph's peak
+                    // memory by one projection, which the STORE graph (the whole sequence) sets; REUSE stays below.
+                    ctx->expand_graph(h);
+                }
                 return ggml_reshape_4d(ctx->ggml_ctx, h, dim_head, heads, x->ne[1], x->ne[2]);
             };
             auto q = project("to_q");
