@@ -347,27 +347,29 @@ namespace Qwen {
             ggml_tensor* result = nullptr;
             if (cache.mode == QwenImage21PrefixCache::Mode::REUSE) {
                 auto prefix_k_cache = ctx->load_cache_tensor(cache.name + ".k");
-                auto prefix_v       = ctx->load_cache_tensor(cache.name + ".v");
-                GGML_ASSERT(prefix_k_cache != nullptr && prefix_v != nullptr);
-                if (prefix_v->type != v->type) {
-                    prefix_v = ggml_cast(ctx->ggml_ctx, prefix_v, v->type);
-                }
-                prefix_v = ggml_reshape_4d(ctx->ggml_ctx, prefix_v, dim_head, heads, cache.prefix_length, v->ne[3]);
-                v        = ggml_concat(ctx->ggml_ctx, prefix_v, v, 2);
-                if (k->type == GGML_TYPE_F16) {
-                    // the prefix's values as the F32 path gets them (cache type -> F32), then -> F16 like its cast
-                    auto prefix_k = prefix_k_cache;
-                    if (prefix_k->type != GGML_TYPE_F16) {
-                        if (prefix_k->type != GGML_TYPE_F32) {
-                            prefix_k = ggml_cast(ctx->ggml_ctx, prefix_k, GGML_TYPE_F32);
+                auto prefix_v_cache = ctx->load_cache_tensor(cache.name + ".v");
+                GGML_ASSERT(prefix_k_cache != nullptr && prefix_v_cache != nullptr);
+                // the prefix's values as the F32 path gets them (cache type -> F32), then -> F16 like its cast
+                auto prefix_f16 = [&](ggml_tensor* prefix) {
+                    if (prefix->type != GGML_TYPE_F16) {
+                        if (prefix->type != GGML_TYPE_F32) {
+                            prefix = ggml_cast(ctx->ggml_ctx, prefix, GGML_TYPE_F32);
                         }
-                        prefix_k = ggml_cast(ctx->ggml_ctx, prefix_k, GGML_TYPE_F16);
+                        prefix = ggml_cast(ctx->ggml_ctx, prefix, GGML_TYPE_F16);
                     }
-                    prefix_k     = ggml_reshape_4d(ctx->ggml_ctx, prefix_k, dim_head, cache.prefix_length, heads, k->ne[3]);
-                    auto k_all   = ggml_concat(ctx->ggml_ctx, prefix_k, k, 1);
-                    bool used_fa = false;
-                    if (ggml_backend_supports_op(ctx->backend, k_all)) {
-                        result = attend(q, k_all, v, nullptr, &used_fa);
+                    return prefix;
+                };
+                if (k->type == GGML_TYPE_F16) {
+                    auto prefix_k = ggml_reshape_4d(ctx->ggml_ctx, prefix_f16(prefix_k_cache), dim_head, cache.prefix_length, heads, k->ne[3]);
+                    auto k_all    = ggml_concat(ctx->ggml_ctx, prefix_k, k, 1);
+                    // V in F16 too: the image tokens cast before the concat, which then moves half the bytes, and flash
+                    // attention takes the F16 V as it is instead of converting the F32 concat (the same
+                    // ggml_cuda_cast<half> values: cast(concat(a, b)) == concat(cast(a), cast(b)) element by element).
+                    auto prefix_v = ggml_reshape_4d(ctx->ggml_ctx, prefix_f16(prefix_v_cache), dim_head, heads, cache.prefix_length, v->ne[3]);
+                    auto v_all    = ggml_concat(ctx->ggml_ctx, prefix_v, ggml_cast(ctx->ggml_ctx, v, GGML_TYPE_F16), 2);
+                    bool used_fa  = false;
+                    if (ggml_backend_supports_op(ctx->backend, k_all) && ggml_backend_supports_op(ctx->backend, v_all)) {
+                        result = attend(q, k_all, v_all, nullptr, &used_fa);
                     }
                     if (!used_fa) {
                         result = nullptr;
@@ -375,6 +377,12 @@ namespace Qwen {
                     }
                 }
                 if (result == nullptr) {
+                    auto prefix_v = prefix_v_cache;
+                    if (prefix_v->type != v->type) {
+                        prefix_v = ggml_cast(ctx->ggml_ctx, prefix_v, v->type);
+                    }
+                    prefix_v      = ggml_reshape_4d(ctx->ggml_ctx, prefix_v, dim_head, heads, cache.prefix_length, v->ne[3]);
+                    v             = ggml_concat(ctx->ggml_ctx, prefix_v, v, 2);
                     auto prefix_k = prefix_k_cache;
                     if (prefix_k->type != k->type) {
                         prefix_k = ggml_cast(ctx->ggml_ctx, prefix_k, k->type);
