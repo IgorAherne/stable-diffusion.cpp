@@ -310,14 +310,14 @@ namespace Qwen {
             auto k = project("to_k");
             auto v = project("to_v");
             q      = norm_rope(ctx, q, "norm_q", rope);
-            // Prefix-cache REUSE with flash attention: K straight from the RoPE op in F16, the values the attention's
-            // F32 -> F16 cast would give, so the concat with the prefix runs in F16 and that cast goes away
-            // (cast(concat(a, b)) == concat(cast(a), cast(b)) element by element). Not with an attention scale
-            // override (it would scale the F16 values) or sage attention (it takes F32 K); if flash attention does not
-            // end up taking K, the F32 path below is built instead.
+            // Prefix-cache REUSE with flash or sage attention: K straight from the RoPE op in F16, the values the
+            // attention's F32 -> F16 cast would give, so the concat with the prefix runs in F16 and that cast goes away
+            // (cast(concat(a, b)) == concat(cast(a), cast(b)) element by element); the sage op takes the F16 K as it is
+            // too (it quantizes K to INT8 from it). Not with an attention scale override (it would scale the F16
+            // values); if neither attention ends up taking K, the F32 path below is built instead.
             auto k_proj      = k;
-            const bool k_f16 = cache.mode == QwenImage21PrefixCache::Mode::REUSE && rope.fused && ctx->flash_attn_enabled &&
-                               !ctx->sage_attn_enabled && !(ctx->attn_scale > 0.f);
+            const bool k_f16 = cache.mode == QwenImage21PrefixCache::Mode::REUSE && rope.fused &&
+                               (ctx->flash_attn_enabled || ctx->sage_attn_enabled) && !(ctx->attn_scale > 0.f);
             k = norm_rope(ctx, k_proj, "norm_k", rope, k_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32);
             if (cache.mode == QwenImage21PrefixCache::Mode::STORE) {
                 // Preserve query-first attention evaluation while writing each layer's
@@ -738,8 +738,10 @@ namespace Qwen {
                 cache.prefix_length = layout.prefix_length;
                 if (prefix_cache_type != GGML_TYPE_COUNT) {
                     cache.type = prefix_cache_type;
-                } else if (!prefix_cache_auto_f32 && flash_attn_enabled && !sage_attn_enabled &&
+                } else if (!prefix_cache_auto_f32 && (flash_attn_enabled || sage_attn_enabled) &&
                            (attn_scale <= 0.f || attn_scale == 1.f)) {
+                    // F16, as flash attention casts K and V to F16 and the sage op reads V in F16 and quantizes K from
+                    // it (half the memory of F32). A graph whose attention takes neither recomputes in F32 (below).
                     cache.type = GGML_TYPE_F16;
                 }
                 cache.mode = has_prefix_cache(cache) ? QwenImage21PrefixCache::Mode::REUSE : QwenImage21PrefixCache::Mode::STORE;
