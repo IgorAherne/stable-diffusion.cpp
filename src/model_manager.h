@@ -14,6 +14,9 @@
 #include "model_component.h"
 #include "model_loader.h"
 
+// The page-locked host slots and the events of a GPU's weight staging ring (model_manager_staging.cpp).
+class StagingRing;
+
 class ModelManager : public DeviceResidencyManager {
 public:
     enum class ResidencyMode {
@@ -101,6 +104,8 @@ private:
     std::map<ggml_backend_t, ggml_backend_t> prefetch_backends_;
     std::map<std::pair<uintptr_t, ggml_backend_t>, RuntimeResidency> runtime_residencies_;
     std::map<uintptr_t, std::function<bool()>> workspace_reclaimers_;
+    // shared_ptr: StagingRing is complete only in model_manager_staging.cpp
+    std::map<ggml_backend_dev_t, std::shared_ptr<StagingRing>> staging_rings_;
     bool warned_split_lora_skip_ = false;
     std::set<std::string> common_ignore_tensors_;
     std::vector<LoraSpec> loras_;
@@ -125,6 +130,17 @@ private:
     void free_prefetch_block(PrefetchBlock& block);
     void clear_all_prefetched_params();
     void release_prefetch();
+
+    // model_manager_staging.cpp: copies of weights whose source is pageable host memory (the model files'
+    // mappings) through a ring of page-locked slots filled by a few threads, which read the model files (or copy
+    // from the mappings, paged in ahead in large reads). Sets copied[i] for each pair it copied (managed ->
+    // staging, before the swap) and returns false, having copied nothing, when the ring does not apply or cannot
+    // be set up.
+    bool copy_through_staging_ring(ggml_backend_t compute_backend,
+                                   ggml_backend_buffer_type_t staging_buft,
+                                   const std::vector<std::pair<TensorState*, ggml_tensor*>>& tensors,
+                                   std::vector<char>& copied);
+    void release_staging_rings();
 
     bool resolve_required_tensor_states(const std::vector<ggml_tensor*>& tensors,
                                         std::vector<TensorState*>& required_states,

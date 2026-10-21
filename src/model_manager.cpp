@@ -148,6 +148,7 @@ static bool device_supports_param_op(ggml_backend_dev_t device,
 
 ModelManager::~ModelManager() {
     release_all();
+    release_staging_rings();
     release_prefetch();
 }
 
@@ -618,11 +619,17 @@ bool ModelManager::stage_tensors_to_compute_backend(const std::vector<TensorStat
                 return false;
             }
             ggml_backend_buffer_set_usage(compute_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-            for (auto& staged_tensor : staged_tensors) {
-                TensorState* state          = staged_tensor.first;
+            // Weights in pageable RAM go through the page-locked staging ring (model_manager_staging.cpp); the
+            // rest, and all of them where the ring does not apply, are copied one tensor at a time.
+            std::vector<char> copied(staged_tensors.size(), 0);
+            copy_through_staging_ring(compute_backend, staging_buft, staged_tensors, copied);
+            for (size_t i = 0; i < staged_tensors.size(); ++i) {
+                TensorState* state          = staged_tensors[i].first;
                 ggml_tensor* managed_tensor = state->tensor;
-                ggml_tensor* staging_tensor = staged_tensor.second;
-                ggml_backend_tensor_copy(managed_tensor, staging_tensor);
+                ggml_tensor* staging_tensor = staged_tensors[i].second;
+                if (!copied[i]) {
+                    ggml_backend_tensor_copy(managed_tensor, staging_tensor);
+                }
                 std::swap(managed_tensor->buffer, staging_tensor->buffer);
                 std::swap(managed_tensor->data, staging_tensor->data);
                 std::swap(managed_tensor->extra, staging_tensor->extra);

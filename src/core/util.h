@@ -63,13 +63,26 @@ public:
     const uint8_t* data() const { return static_cast<uint8_t*>(data_); }
     uint8_t* writable_data() { return static_cast<uint8_t*>(data_); }
     size_t size() const { return size_; }
+    // A copy-on-write mapping: its pages may differ from the file (LoRAs merged into it in place).
+    bool writable() const { return writable_; }
     bool copy_data(void* buf, size_t n, size_t offset) const;
 
+    // Positional reads of the mapped file with file I/O, through the system's file cache instead of the mapping,
+    // so the bytes read never join the process's working set. Not shared between threads: one reader each.
+    class FileReader {
+    public:
+        virtual ~FileReader()                                    = default;
+        virtual bool read(void* dst, size_t offset, size_t size) = 0;
+    };
+    // nullptr when the file cannot be opened again for reading.
+    virtual std::unique_ptr<FileReader> open_reader() const { return nullptr; }
+
 protected:
-    MmapWrapper(void* data, size_t size)
-        : data_(data), size_(size) {}
-    void* data_  = nullptr;
-    size_t size_ = 0;
+    MmapWrapper(void* data, size_t size, bool writable)
+        : data_(data), size_(size), writable_(writable) {}
+    void* data_    = nullptr;
+    size_t size_   = 0;
+    bool writable_ = false;
 };
 
 std::string path_join(const std::string& p1, const std::string& p2);

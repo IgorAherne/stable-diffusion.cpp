@@ -1,6 +1,7 @@
 #include "core/util.h"
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <cmath>
 #include <codecvt>
 #include <cstdarg>
@@ -119,8 +120,8 @@ bool is_directory(const std::string& path) {
 
 class MmapWrapperImpl : public MmapWrapper {
 public:
-    MmapWrapperImpl(void* data, size_t size, HANDLE hfile, HANDLE hmapping)
-        : MmapWrapper(data, size), hfile_(hfile), hmapping_(hmapping) {}
+    MmapWrapperImpl(void* data, size_t size, bool writable, HANDLE hfile, HANDLE hmapping)
+        : MmapWrapper(data, size, writable), hfile_(hfile), hmapping_(hmapping) {}
 
     ~MmapWrapperImpl() override {
         UnmapViewOfFile(data_);
@@ -128,7 +129,49 @@ public:
         CloseHandle(hfile_);
     }
 
+    // A handle of its own per reader: reads on one synchronous handle are serialized by the system. ReOpenFile opens
+    // the very file that is mapped, even if its path now names another one.
+    std::unique_ptr<FileReader> open_reader() const override {
+        HANDLE handle = ReOpenFile(hfile_, GENERIC_READ, FILE_SHARE_READ, 0);
+        if (handle == INVALID_HANDLE_VALUE) {
+            return nullptr;
+        }
+        return std::make_unique<HandleReader>(handle, size_);
+    }
+
 private:
+    class HandleReader : public FileReader {
+    public:
+        HandleReader(HANDLE handle, size_t file_size)
+            : handle_(handle), file_size_(file_size) {}
+        ~HandleReader() override { CloseHandle(handle_); }
+
+        bool read(void* dst, size_t offset, size_t size) override {
+            if (offset > file_size_ || size > file_size_ - offset) {
+                return false;
+            }
+            uint8_t* out = static_cast<uint8_t*>(dst);
+            while (size > 0) {
+                const DWORD request = static_cast<DWORD>(std::min<size_t>(size, 1u << 30));
+                OVERLAPPED position{};
+                position.Offset     = static_cast<DWORD>(offset & 0xffffffffu);
+                position.OffsetHigh = static_cast<DWORD>(static_cast<uint64_t>(offset) >> 32);
+                DWORD got           = 0;
+                if (!ReadFile(handle_, out, request, &got, &position) || got == 0) {
+                    return false;
+                }
+                out += got;
+                offset += got;
+                size -= got;
+            }
+            return true;
+        }
+
+    private:
+        HANDLE handle_;
+        size_t file_size_;
+    };
+
     HANDLE hfile_;
     HANDLE hmapping_;
 };
@@ -177,7 +220,7 @@ std::unique_ptr<MmapWrapper> MmapWrapper::create(const std::string& filename, bo
         return nullptr;
     }
 
-    return std::make_unique<MmapWrapperImpl>(mapped_data, file_size, file_handle, mapping_handle);
+    return std::make_unique<MmapWrapperImpl>(mapped_data, file_size, writable, file_handle, mapping_handle);
 }
 
 #else  // Unix
@@ -229,8 +272,13 @@ static MmapFlags get_mmap_flags() {
 
 class MmapWrapperImpl : public MmapWrapper {
 public:
-    MmapWrapperImpl(void* data, size_t size, int fd)
-        : MmapWrapper(data, size), fd_(fd) {}
+    MmapWrapperImpl(void* data, size_t size, bool writable, int fd)
+        : MmapWrapper(data, size, writable), fd_(fd) {}
+
+    // pread is positional, so the readers share the mapping's descriptor.
+    std::unique_ptr<FileReader> open_reader() const override {
+        return std::make_unique<DescriptorReader>(fd_, size_);
+    }
 
     ~MmapWrapperImpl() override {
 #ifdef __linux__
@@ -253,6 +301,36 @@ public:
     }
 
 private:
+    class DescriptorReader : public FileReader {
+    public:
+        DescriptorReader(int fd, size_t file_size)
+            : fd_(fd), file_size_(file_size) {}
+
+        bool read(void* dst, size_t offset, size_t size) override {
+            if (offset > file_size_ || size > file_size_ - offset) {
+                return false;
+            }
+            uint8_t* out = static_cast<uint8_t*>(dst);
+            while (size > 0) {
+                const ssize_t got = pread(fd_, out, size, static_cast<off_t>(offset));
+                if (got < 0 && errno == EINTR) {
+                    continue;
+                }
+                if (got <= 0) {
+                    return false;
+                }
+                out += got;
+                offset += static_cast<size_t>(got);
+                size -= static_cast<size_t>(got);
+            }
+            return true;
+        }
+
+    private:
+        int fd_;
+        size_t file_size_;
+    };
+
     int fd_;
 };
 
@@ -306,7 +384,7 @@ std::unique_ptr<MmapWrapper> MmapWrapper::create(const std::string& filename, bo
     }
 #endif
 
-    return std::make_unique<MmapWrapperImpl>(mapped_data, file_size, file_descriptor);
+    return std::make_unique<MmapWrapperImpl>(mapped_data, file_size, writable, file_descriptor);
 }
 
 #endif

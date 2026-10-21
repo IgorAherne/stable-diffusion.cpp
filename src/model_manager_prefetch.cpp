@@ -128,9 +128,15 @@ bool ModelManager::populate_prefetch_block(PrefetchBlock& block) {
         ggml_backend_buffer_set_usage(staging_block->buffer,
                                       GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
-        for (const auto& pair : staging_block->staged_tensors) {
-            TensorState* state          = pair.first;
-            ggml_tensor* staging_tensor = pair.second;
+        // An upload from pageable RAM is not asynchronous anyway (the driver stages it); the ring is faster.
+        std::vector<char> copied(staging_block->staged_tensors.size(), 0);
+        copy_through_staging_ring(block.compute_backend, buffer_type, staging_block->staged_tensors, copied);
+        for (size_t i = 0; i < staging_block->staged_tensors.size(); ++i) {
+            if (copied[i]) {
+                continue;
+            }
+            TensorState* state          = staging_block->staged_tensors[i].first;
+            ggml_tensor* staging_tensor = staging_block->staged_tensors[i].second;
             const bool host_source      = ggml_backend_buffer_is_host(state->tensor->buffer);
             if (host_source) {
                 ggml_backend_tensor_set_async(block.transfer_backend,
