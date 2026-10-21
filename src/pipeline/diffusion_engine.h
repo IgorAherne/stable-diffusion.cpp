@@ -181,6 +181,13 @@ public:
     RunnerState runner_state_;
     std::unique_ptr<ConditioningCache> conditioning_cache_;
     std::vector<ModelManager::LoraSpec> conditioning_loras_;
+    // Example pictures' VAE latents by the encoder's exact input (see encode_reference_image).
+    struct ReferenceLatent {
+        sd::Tensor<float> image;
+        sd::Tensor<float> latent;
+        bool used = false;
+    };
+    std::vector<ReferenceLatent> reference_latents_;
     bool executing_ = false;
 
     std::shared_ptr<Denoiser> denoiser;
@@ -198,6 +205,13 @@ public:
     void capture_runner_sources();
 
     void end_runners();
+
+    // The conditioning cache, the example pictures' latents and what the diffusion runners keep between pictures:
+    // all computed with the current weights (models, LoRAs).
+    void clear_generation_caches();
+
+    // Drops what the idle diffusion runners keep between pictures (Qwen Image 2.1's prefix K/V).
+    void drop_retained_diffusion_caches();
 
     bool reset_runners(const RunnerGroups& groups);
 
@@ -478,6 +492,12 @@ public:
     sd::Tensor<float> encode_to_vae_latents(const sd::Tensor<float>& x);
 
     sd::Tensor<float> encode_first_stage(const sd::Tensor<float>& x);
+
+    // encode_first_stage for an example picture (cached for Qwen Image 2.1); end_reference_images() after a
+    // request's pictures keeps the latents of those only.
+    sd::Tensor<float> encode_reference_image(const sd::Tensor<float>& image);
+
+    void end_reference_images();
 
     sd::Tensor<float> decode_first_stage(const sd::Tensor<float>& x, bool decode_video = false);
 

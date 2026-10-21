@@ -2,6 +2,7 @@
 #define __SD_CONDITIONING_CONDITIONING_CACHE_H__
 
 #include <algorithm>
+#include <functional>
 #include <list>
 #include <tuple>
 
@@ -81,8 +82,12 @@ public:
         entries_.clear();
     }
 
-    SDCondition get(Conditioner& conditioner, int n_threads, const ConditionerParams& params) {
+    // before_compute: called when the conditioner has to run (a miss).
+    SDCondition get(Conditioner& conditioner, int n_threads, const ConditionerParams& params, const std::function<void()>& before_compute = {}) {
         if (capacity_ == 0) {
+            if (before_compute) {
+                before_compute();
+            }
             return conditioner.get_learned_condition(n_threads, params);
         }
         for (auto it = entries_.begin(); it != entries_.end(); ++it) {
@@ -91,6 +96,9 @@ public:
                 LOG_INFO("conditioning cache hit");
                 return entries_.front().condition;
             }
+        }
+        if (before_compute) {
+            before_compute();
         }
         auto condition = conditioner.get_learned_condition(n_threads, params);
         if (!condition.empty()) {

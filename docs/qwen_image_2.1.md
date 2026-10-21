@@ -42,7 +42,15 @@ For multiple reference images, repeat `-r` in the desired order, for example `-r
 
 ### Prefix cache
 
-By default, the first denoising call for each fixed condition saves the text and reference-image keys and values from every transformer layer. Later calls only compute the target-image tokens. Positive and negative conditions use separate caches, which are released when sampling ends.
+By default, the first denoising call for each fixed condition saves the text and reference-image keys and values from every transformer layer. Later calls only compute the target-image tokens. Positive and negative conditions use separate caches.
+
+`qwen_image_2_1_prefix_cache_keep` in `--model-args` sets whether a cache outlives its sampling run, so that the next image with the same condition (another seed in a new request, or the next image of `--batch-count`) skips the prefix pass in its first step too. Caches are matched by the exact values of the conditioning, the reference latents, the token layout, the target latent's shape and the attention settings. A kept cache stays in device memory between images and is released when the VAE needs that memory, when a new prompt or new reference images are encoded, when a later run does not use it, and when models or LoRAs change.
+
+- `auto` (default): keep the caches only with Flash Attention and without Sage Attention. Flash Attention converts the keys to FP16 in both the cache-writing and the cache-reading graphs, so a kept cache gives bit-identical images.
+- `on`: keep the caches with every attention. With Sage Attention, the cache-writing graph also passes the generated image's keys in FP16, like the cache-reading graphs do, because Sage Attention quantizes keys from the type it receives. This keeps an image identical whether its cache was kept or rebuilt, but images differ from `auto` and `off` by rounding.
+- `off`: release the caches when sampling ends.
+
+With Qwen Image 2.1, the latents of the reference images are also kept for the next request with the same reference images (unless VAE tiling or circular padding is enabled).
 
 Set `qwen_image_2_1_prefix_cache_type` in `--model-args` to `auto` or a type name using the same parser and case-sensitive names as `--type`:
 

@@ -152,6 +152,8 @@ private:
     std::map<ggml_backend_t, size_t> logged_compute_bytes_;
     size_t logged_segment_count_     = 0;
     ggml_status last_compute_status_ = GGML_STATUS_SUCCESS;
+    int retained_cache_offers_       = 0;
+    bool retained_cache_reclaimer_   = false;
 
     sd::ComputeWorkspace::Measurement measure(ggml_cgraph* graph, size_t direct_bytes);
     std::vector<DeviceMemoryRequest> memory_requests(const std::vector<sd::BackendBufferSize>& sizes,
@@ -159,6 +161,7 @@ private:
     bool fits(const std::vector<DeviceMemoryRequest>& requests,
               const std::vector<ggml_tensor*>& params) const;
     bool execute_segment(ggml_cgraph* graph, int n_threads);
+    void update_retained_cache_reclaimer();
     std::optional<sd::Tensor<float>> execute_graph(ggml_cgraph* graph, int n_threads, bool no_return, const std::function<bool()>& read_outputs);
 
 protected:
@@ -284,6 +287,12 @@ protected:
 
     void sync_runtime_residency();
 
+    // Cache entries kept from one run (runner_start .. runner_end) to the next, e.g. a prompt's prefix that the next
+    // picture with the same inputs reuses. Between runs they stay on the device as this runner's runtime residency;
+    // free_cache_ctx_and_buffer() drops them, and so does the residency manager while they are offered
+    // (offer_retained_cache).
+    virtual bool retain_cache_entry(const std::string& name) const { return false; }
+
     std::optional<sd::Tensor<float>> read_graph_tensor(ggml_tensor* tensor, const char* label);
 
     void copy_data_to_backend_tensor(ggml_cgraph* gf, bool clear_after_copy = true);
@@ -300,6 +309,12 @@ public:
     bool runner_started() const { return runner_started_; }
 
     void runner_end();
+
+    // While this runner is idle, lets the residency manager drop the cache entries it retains (retain_cache_entry)
+    // when another runner cannot fit next to them. Nested offers are counted; offer_retained_cache(false) withdraws
+    // one. Only for the span of another runner's work: the manager takes any registered reclaimer for an execution
+    // in progress and refuses LoRA and model source changes meanwhile.
+    void offer_retained_cache(bool offered);
 
 public:
     virtual std::string get_desc() = 0;

@@ -462,9 +462,10 @@ bool GGMLRunner::runner_start() {
     if (runner_started_) {
         return true;
     }
-    cache_.clear();
+    cache_.retain([this](const std::string& name) { return retain_cache_entry(name); });
     workspace_.set_extra_backends(extra_runtime_backends);
     if (auto manager = residency_manager.lock()) {
+        // (replaces the retained cache's reclaimer, if offered: what a run uses must stay)
         manager->set_workspace_reclaimer(reinterpret_cast<uintptr_t>(this), [this]() {
             if (!workspace_.release()) {
                 return false;
@@ -473,8 +474,38 @@ bool GGMLRunner::runner_start() {
             return true;
         });
     }
-    runner_started_ = true;
+    retained_cache_reclaimer_ = false;
+    runner_started_           = true;
     return true;
+}
+
+void GGMLRunner::offer_retained_cache(bool offered) {
+    retained_cache_offers_ = std::max(0, retained_cache_offers_ + (offered ? 1 : -1));
+    update_retained_cache_reclaimer();
+}
+
+void GGMLRunner::update_retained_cache_reclaimer() {
+    auto manager = residency_manager.lock();
+    if (runner_started_ || manager == nullptr) {
+        return;
+    }
+    const uintptr_t owner = reinterpret_cast<uintptr_t>(this);
+    if (retained_cache_offers_ > 0 && !retained_cache_reclaimer_ && !cache_.empty()) {
+        manager->set_workspace_reclaimer(owner, [this]() {
+            // Idle: no graph refers to the entries (a run replaces this reclaimer at runner_start).
+            const size_t bytes = cache_.resident_bytes(ggml_backend_get_device(runtime_backend));
+            cache_.clear();
+            sync_runtime_residency();
+            LOG_VERBOSE("%s dropped %.2f MB of cached tensors kept for its next run: another runner needs the memory",
+                        get_desc().c_str(), bytes / (1024.0 * 1024.0));
+            return true;
+        });
+        retained_cache_reclaimer_ = true;
+    } else if (retained_cache_offers_ == 0 && retained_cache_reclaimer_) {
+        manager->remove_runtime_owner(owner);  // the reclaimer, and the residency entry, re-added next
+        retained_cache_reclaimer_ = false;
+        sync_runtime_residency();
+    }
 }
 
 void GGMLRunner::runner_end() {
@@ -483,7 +514,8 @@ void GGMLRunner::runner_end() {
         return;
     }
     workspace_.release();
-    cache_.clear();
+    cache_.graph_end(false);
+    cache_.retain([this](const std::string& name) { return retain_cache_entry(name); });
     logged_compute_bytes_.clear();
     logged_segment_count_ = 0;
     if (auto manager = residency_manager.lock()) {
@@ -498,6 +530,11 @@ void GGMLRunner::runner_end() {
         manager->remove_runtime_owner(reinterpret_cast<uintptr_t>(this));
     }
     runner_started_ = false;
+    if (!cache_.empty()) {
+        // The retained entries stay on the device: the other runners' capacity checks count them.
+        sync_runtime_residency();
+        update_retained_cache_reclaimer();
+    }
 }
 
 GGMLRunner::GGMLRunner(ggml_backend_t backend,
@@ -513,6 +550,12 @@ GGMLRunner::GGMLRunner(ggml_backend_t backend,
 
 GGMLRunner::~GGMLRunner() {
     runner_end();
+    if (!cache_.empty() || retained_cache_reclaimer_) {
+        // Retained entries registered for an idle runner (see retain_cache_entry): their memory goes with the cache.
+        if (auto manager = residency_manager.lock()) {
+            manager->remove_runtime_owner(reinterpret_cast<uintptr_t>(this));
+        }
+    }
     free_compute_ctx();
     free_params_ctx();
 }

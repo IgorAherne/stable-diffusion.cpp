@@ -1,7 +1,10 @@
 #ifndef __SD_MODEL_DIFFUSION_QWEN_IMAGE_2_1_H__
 #define __SD_MODEL_DIFFUSION_QWEN_IMAGE_2_1_H__
 
+#include <algorithm>
 #include <array>
+#include <cstring>
+#include <map>
 #include <typeinfo>
 
 #include "model/diffusion/qwen_image.hpp"
@@ -144,6 +147,10 @@ namespace Qwen {
         int64_t prefix_length = 0;
         ggml_type type        = GGML_TYPE_F32;
         bool* flash_attn_used = nullptr;
+        // STORE and uncached graphs: the picture being drawn (the last segment) attends to K in F16, as the REUSE graphs
+        // give it to the attention, so a step that reuses a kept prefix computes what these do (see
+        // QwenImage21Runner::PrefixKeep).
+        bool f16_target_keys = false;
     };
 
     // Rope::apply_rope's permute of the table (pe [2, 2, d_head/2, L] -> [2, d_head/2, L, 2]), done once per graph and
@@ -410,10 +417,16 @@ namespace Qwen {
                     result   = attend(q, k, v, nullptr);
                 }
             } else {
+                // f16_target_keys: the same F32 -> F16 values the REUSE graph's K has (its cache, its RoPE op's output)
+                auto keys = [&](ggml_tensor* sk, size_t i) {
+                    const bool f16 = cache.f16_target_keys && i + 1 == segments.size() && rope.fused &&
+                                     !(ctx->attn_scale > 0.f) && sk->type == GGML_TYPE_F32;
+                    return f16 ? ggml_cast(ctx->ggml_ctx, sk, GGML_TYPE_F16) : sk;
+                };
                 for (size_t i = 0; i < segments.size(); ++i) {
                     const auto& segment = segments[i];
                     auto sq             = ggml_ext_slice(ctx->ggml_ctx, q, 1, segment.start, segment.end);
-                    auto sk             = ggml_ext_slice(ctx->ggml_ctx, k, 1, 0, segment.end);
+                    auto sk             = keys(ggml_ext_slice(ctx->ggml_ctx, k, 1, 0, segment.end), i);
                     auto sv             = ggml_ext_slice(ctx->ggml_ctx, v, 2, 0, segment.end);
                     auto out            = attend(sq, sk, sv, masks[i]);
                     result              = result == nullptr ? out : ggml_concat(ctx->ggml_ctx, result, out, 1);
@@ -626,6 +639,49 @@ namespace Qwen {
         bool prefix_cache_disabled  = false;
         bool prefix_cache_auto_f32  = false;
 
+        // Whether the prefixes outlive the sampling run (model arg qwen_image_2_1_prefix_cache_keep=auto|on|off). Every
+        // re-roll (a new generate call) and every variation (batch_count) starts a new run, which computed the prefix
+        // again in its first step: RTX 3060, one 1024x1024 example picture (4,155 prefix tokens), 4.4 s instead of
+        // 1.9 s under SageAttention, 5.4 s instead of 2.6 s under flash attention. The kept K/V are exactly the ones a
+        // STORE step computes, but that step's own attention takes the keys in F32 and a REUSE step in F16: the same
+        // values for flash attention (it casts them to F16), not for SageAttention (it quantizes them to INT8 from
+        // what it gets). So, measured: under flash attention a reused prefix gives the picture bit for bit; under
+        // SageAttention it differs (55 dB PSNR at 25 steps with the example picture; 35.5 dB and a lock's shape
+        // changed, text only), and a variation would no longer be the picture its seed gives on its own.
+        // AUTO: kept under flash attention without SageAttention only (the pictures stay what they were).
+        // ON: kept everywhere; under SageAttention the STORE step then gives the drawn picture's attention the keys in
+        // F16 as well (f16_target_keys), so a picture is what its seed gives with or without a kept prefix (measured
+        // bit for bit), and differs from AUTO's by that rounding (53-55 dB PSNR with the example picture).
+        // OFF: never kept.
+        enum class PrefixKeep {
+            AUTO,
+            ON,
+            OFF
+        };
+        PrefixKeep prefix_cache_keep = PrefixKeep::AUTO;
+
+        bool keep_prefixes() const {
+            return prefix_cache_keep == PrefixKeep::ON ||
+                   (prefix_cache_keep == PrefixKeep::AUTO && flash_attn_enabled && !sage_attn_enabled);
+        }
+
+        // The prefixes whose K/V the cache holds, with copies of everything those were computed from (when kept):
+        // matched by content, as the tensors behind the engine's prefix ids are new for every request. The K/V do not
+        // depend on the seed or the timestep.
+        struct RetainedPrefix {
+            std::string name;
+            sd::Tensor<float> context;
+            sd::Tensor<int32_t> image_slots;
+            std::vector<sd::Tensor<float>> refs;
+            std::vector<int64_t> x_shape;  // the STORE graph's shapes, so the cached values are the ones it computes
+            std::array<float, 2> scales;   // linear_scale, attn_scale
+            std::array<bool, 4> flags;     // circular x / y, flash and sage attention
+            bool used = false;             // by the current sampling run
+        };
+        std::vector<RetainedPrefix> retained_prefixes;
+        std::map<uint64_t, std::string> run_prefixes;  // this run's prefix ids -> RetainedPrefix::name
+        uint64_t next_prefix_serial = 1;
+
         static bool supports_prefix_cache_type(ggml_type type) {
             if (type == GGML_TYPE_F32) {
                 return true;
@@ -658,6 +714,15 @@ namespace Qwen {
             for (const auto& [key, value] : parse_key_value_args(model_args, "model arg")) {
                 if (key == "qwen_image_2_1_prefix_cache" && !parse_strict_bool(value, prefix_cache_enabled)) {
                     LOG_WARN("ignoring invalid Qwen Image 2.1 model arg '%s=%s'", key.c_str(), value.c_str());
+                } else if (key == "qwen_image_2_1_prefix_cache_keep") {
+                    bool keep = false;
+                    if (value == "auto") {
+                        prefix_cache_keep = PrefixKeep::AUTO;
+                    } else if (parse_strict_bool(value, keep)) {
+                        prefix_cache_keep = keep ? PrefixKeep::ON : PrefixKeep::OFF;
+                    } else {
+                        LOG_WARN("ignoring invalid Qwen Image 2.1 model arg '%s=%s'", key.c_str(), value.c_str());
+                    }
                 } else if (key == "qwen_image_2_1_prefix_cache_type") {
                     if (value == "auto") {
                         prefix_cache_type = GGML_TYPE_COUNT;
@@ -699,6 +764,82 @@ namespace Qwen {
             return true;
         }
 
+        bool owns_prefix_entry(const std::string& name) const {
+            return std::any_of(retained_prefixes.begin(), retained_prefixes.end(), [&](const RetainedPrefix& prefix) {
+                return starts_with(name, prefix.name + ".");
+            });
+        }
+
+        bool retain_cache_entry(const std::string& name) const override {
+            return keep_prefixes() && owns_prefix_entry(name);
+        }
+
+        // Frees the K/V of the prefixes the current run has not used.
+        void drop_unused_prefixes() {
+            auto unused = std::remove_if(retained_prefixes.begin(), retained_prefixes.end(),
+                                         [](const RetainedPrefix& prefix) { return !prefix.used; });
+            if (unused == retained_prefixes.end()) {
+                return;
+            }
+            retained_prefixes.erase(unused, retained_prefixes.end());
+            cache_.retain([this](const std::string& name) { return owns_prefix_entry(name); });
+            sync_runtime_residency();
+        }
+
+        // The cache name for this run's prefix id: the prefix computed earlier from the same inputs (bit for bit, the
+        // same graph shapes and settings), else a new one, for which the prefixes this run does not use make room
+        // (with CFG, a changed prompt then drops the unchanged negative prompt's prefix too). first_use: the id's
+        // first compute in this run.
+        std::string resolve_prefix(uint64_t prefix_id,
+                                   const sd::Tensor<float>& context,
+                                   const sd::Tensor<int32_t>& image_slots,
+                                   const std::vector<sd::Tensor<float>>& refs,
+                                   const sd::Tensor<float>& x,
+                                   bool* first_use) {
+            auto run   = run_prefixes.find(prefix_id);
+            *first_use = run == run_prefixes.end();
+            if (!*first_use) {
+                return run->second;
+            }
+            auto same = [](const auto& a, const auto& b) {
+                return a.shape() == b.shape() && a.numel() == b.numel() &&
+                       (a.numel() == 0 || std::memcmp(a.data(), b.data(), static_cast<size_t>(a.numel()) * sizeof(*a.data())) == 0);
+            };
+            const std::array<float, 2> scales = {linear_scale, attn_scale};
+            const std::array<bool, 4> flags   = {circular_x_enabled, circular_y_enabled, flash_attn_enabled, sage_attn_enabled};
+
+            auto entry = std::find_if(retained_prefixes.begin(), retained_prefixes.end(), [&](const RetainedPrefix& prefix) {
+                if (prefix.x_shape != x.shape() || prefix.scales != scales || prefix.flags != flags ||
+                    prefix.refs.size() != refs.size() || !same(prefix.context, context) || !same(prefix.image_slots, image_slots)) {
+                    return false;
+                }
+                for (size_t i = 0; i < refs.size(); ++i) {
+                    if (!same(prefix.refs[i], refs[i])) {
+                        return false;
+                    }
+                }
+                return true;
+            });
+            if (entry == retained_prefixes.end()) {
+                drop_unused_prefixes();
+                RetainedPrefix prefix;
+                prefix.name = "qwen_image_2_1.prefix." + std::to_string(next_prefix_serial++);
+                if (keep_prefixes()) {
+                    prefix.context     = context;
+                    prefix.image_slots = image_slots;
+                    prefix.refs        = refs;
+                    prefix.x_shape     = x.shape();
+                    prefix.scales      = scales;
+                    prefix.flags       = flags;
+                }
+                retained_prefixes.push_back(std::move(prefix));
+                entry = std::prev(retained_prefixes.end());
+            }
+            entry->used             = true;
+            run_prefixes[prefix_id] = entry->name;
+            return entry->name;
+        }
+
         sd::Tensor<float> compute(int n_threads, const DiffusionParams& inputs) override {
             const auto& x       = tensor_or_empty(inputs.x);
             const auto& context = tensor_or_empty(inputs.context);
@@ -728,13 +869,25 @@ namespace Qwen {
                 return {};
             }
             if (!runner_started()) {
+                // A new sampling run (sample() ends the runner after each): its prefix ids start again, and the
+                // prefixes the previous run did not use go.
                 prefix_cache_disabled = false;
                 prefix_cache_auto_f32 = false;
+                run_prefixes.clear();
+                if (keep_prefixes()) {
+                    drop_unused_prefixes();
+                } else {
+                    retained_prefixes.clear();
+                }
+                for (auto& prefix : retained_prefixes) {
+                    prefix.used = false;
+                }
             }
             QwenImage21PrefixCache cache;
+            cache.f16_target_keys = prefix_cache_keep == PrefixKeep::ON && sage_attn_enabled;
+            bool first_use        = false;
             if (prefix_cache_enabled && !prefix_cache_disabled && extra != nullptr && extra->prefix_id != 0 && layout.prefix_length > 0) {
-                cache.name = "qwen_image_2_1.prefix." + std::to_string(extra->prefix_id) +
-                             ".circular." + std::to_string(circular_x_enabled) + std::to_string(circular_y_enabled);
+                cache.name          = resolve_prefix(extra->prefix_id, context, tensor_or_empty(extra->image_slots), refs, x, &first_use);
                 cache.prefix_length = layout.prefix_length;
                 if (prefix_cache_type != GGML_TYPE_COUNT) {
                     cache.type = prefix_cache_type;
@@ -745,6 +898,12 @@ namespace Qwen {
                     cache.type = GGML_TYPE_F16;
                 }
                 cache.mode = has_prefix_cache(cache) ? QwenImage21PrefixCache::Mode::REUSE : QwenImage21PrefixCache::Mode::STORE;
+                if (first_use && cache.mode == QwenImage21PrefixCache::Mode::REUSE) {
+                    LOG_VERBOSE("Qwen Image 2.1: reusing the prefix of an earlier picture (%" PRId64 " tokens, %s)",
+                                layout.prefix_length, ggml_type_name(cache.type));
+                }
+            } else {
+                drop_unused_prefixes();
             }
             bool flash_attn_used = true;
             auto run             = [&](const QwenImage21PrefixCache& active_cache) {
@@ -855,7 +1014,9 @@ namespace Qwen {
                 free_cache_ctx_and_buffer();
                 prefix_cache_disabled = true;
                 LOG_WARN("Qwen Image 2.1: insufficient memory for prefix caching; retrying without it for this sampling run");
-                return run(QwenImage21PrefixCache{});
+                QwenImage21PrefixCache uncached;
+                uncached.f16_target_keys = cache.f16_target_keys;
+                return run(uncached);
             }
             if (!result.empty() && cache.mode == QwenImage21PrefixCache::Mode::STORE) {
                 if (!has_prefix_cache(cache)) {
@@ -863,7 +1024,14 @@ namespace Qwen {
                     prefix_cache_disabled = true;
                     LOG_WARN("Qwen Image 2.1: incomplete prefix cache; disabling it for this sampling run");
                 } else {
-                    LOG_DEBUG("Qwen Image 2.1: cached prefix %" PRIu64 " (%" PRId64 " tokens, %s)", extra->prefix_id, layout.prefix_length, ggml_type_name(cache.type));
+                    LOG_DEBUG("Qwen Image 2.1: cached prefix %s (%" PRId64 " tokens, %s)", cache.name.c_str(), layout.prefix_length, ggml_type_name(cache.type));
+                    // The STORE graph's compute buffer is the run's largest (3,617 MB with one 1024x1024 example
+                    // picture, 709 MB for the steps that reuse the prefix). Kept, it counted as this runner's memory
+                    // in those steps' fit check and pushed them into layer segments where the budget is tight (8 GB
+                    // cards with a 668x668 example: 34 segments, 1.83 s a step instead of 1.54 s in one piece; two
+                    // example pictures on 12 GB: 3.19 s instead of 2.90 s). The same values either way.
+                    workspace_.release();
+                    sync_runtime_residency();
                 }
             }
             return result;

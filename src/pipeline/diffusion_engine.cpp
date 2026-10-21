@@ -1,9 +1,11 @@
 #include "diffusion_engine.h"
 
 #include <algorithm>
+#include <array>
 #include <cinttypes>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <list>
 #include <mutex>
 #include <set>
@@ -220,8 +222,26 @@ void StableDiffusionGGML::end_runners() {
             lora.model->runner_end();
 }
 
-bool StableDiffusionGGML::reset_runners(const RunnerGroups& groups) {
+void StableDiffusionGGML::clear_generation_caches() {
     conditioning_cache_->clear();
+    reference_latents_.clear();
+    for (const auto& runner : {diffusion_model, high_noise_diffusion_model}) {
+        if (runner) {
+            runner->free_cache_ctx_and_buffer();
+        }
+    }
+}
+
+void StableDiffusionGGML::drop_retained_diffusion_caches() {
+    for (const auto& runner : {diffusion_model, high_noise_diffusion_model}) {
+        if (runner && !runner->runner_started()) {
+            runner->free_cache_ctx_and_buffer();
+        }
+    }
+}
+
+bool StableDiffusionGGML::reset_runners(const RunnerGroups& groups) {
+    clear_generation_caches();
     conditioning_loras_.clear();
     end_runners();
     clear_lora_adapters();
@@ -1804,7 +1824,7 @@ bool StableDiffusionGGML::apply_loras(const sd_lora_t* loras, uint32_t lora_coun
     end_runners();
     clear_lora_adapters();
     if (!model_manager->prepare_lora_sources(all_loras)) {
-        conditioning_cache_->clear();
+        clear_generation_caches();
         return false;
     }
     if (!std::equal(all_loras.begin(), all_loras.end(),
@@ -1814,7 +1834,7 @@ bool StableDiffusionGGML::apply_loras(const sd_lora_t* loras, uint32_t lora_coun
                                a.multiplier == b.multiplier && a.is_high_noise == b.is_high_noise &&
                                a.tensor_name_prefix_filter == b.tensor_name_prefix_filter;
                     })) {
-        conditioning_cache_->clear();
+        clear_generation_caches();
     }
     runtime_lora_models.erase(std::remove_if(runtime_lora_models.begin(), runtime_lora_models.end(), [&](const RuntimeLora& entry) {
                                   return std::none_of(all_loras.begin(), all_loras.end(), [&](const ModelManager::LoraSpec& spec) {
@@ -1825,7 +1845,7 @@ bool StableDiffusionGGML::apply_loras(const sd_lora_t* loras, uint32_t lora_coun
     const bool success = apply_lora_immediately ? apply_loras_immediately(all_loras)
                                                 : apply_loras_at_runtime(all_loras);
     if (!success) {
-        conditioning_cache_->clear();
+        clear_generation_caches();
         clear_lora_adapters();
         runtime_lora_models.clear();
         return false;
@@ -1840,7 +1860,10 @@ bool StableDiffusionGGML::apply_loras(const sd_lora_t* loras, uint32_t lora_coun
 }
 
 SDCondition StableDiffusionGGML::get_learned_condition(const ConditionerParams& params) {
-    return conditioning_cache_->get(*cond_stage_model, n_threads, params);
+    // A miss is a new prompt or new example pictures, whose prefix differs from the one the diffusion runner keeps:
+    // that one would only take the text encoder's room (4,418 MB of weights; the encoder runs in layer segments
+    // rather than reclaiming memory when it does not fit in one piece).
+    return conditioning_cache_->get(*cond_stage_model, n_threads, params, [this]() { drop_retained_diffusion_caches(); });
 }
 
 void StableDiffusionGGML::reset_generation_extensions() {
@@ -2872,7 +2895,40 @@ int StableDiffusionGGML::align_video_frames(int frames) {
     return latent_frames_to_video_frames(video_frames_to_latent_frames(frames));
 }
 
+// While the VAE works between pictures, the residency manager may drop what the idle diffusion runners keep for the
+// next picture (Qwen Image 2.1's prefix K/V: ~2 GB in F16 with one 1024x1024 example picture) where the VAE cannot fit
+// next to it (the decode: 7,777 MB im2col on 12 GB cards, 3,889 MB direct on 8 GB cards), instead of the VAE failing
+// and retrying in tiles; where it fits, the prefix stays. Only while another runner works: the manager takes a
+// registered reclaimer for an execution in progress.
+namespace {
+    class RetainedDiffusionCacheOffer {
+        std::array<std::shared_ptr<DiffusionModelRunner>, 2> runners_;
+
+    public:
+        explicit RetainedDiffusionCacheOffer(StableDiffusionGGML& sd)
+            : runners_{sd.diffusion_model, sd.high_noise_diffusion_model} {
+            for (const auto& runner : runners_) {
+                if (runner) {
+                    runner->offer_retained_cache(true);
+                }
+            }
+        }
+
+        ~RetainedDiffusionCacheOffer() {
+            for (const auto& runner : runners_) {
+                if (runner) {
+                    runner->offer_retained_cache(false);
+                }
+            }
+        }
+
+        RetainedDiffusionCacheOffer(const RetainedDiffusionCacheOffer&)            = delete;
+        RetainedDiffusionCacheOffer& operator=(const RetainedDiffusionCacheOffer&) = delete;
+    };
+}  // namespace
+
 sd::Tensor<float> StableDiffusionGGML::encode_to_vae_latents(const sd::Tensor<float>& x) {
+    RetainedDiffusionCacheOffer offer(*this);
     auto latents = first_stage_model->encode(n_threads, x, vae_tiling_params, circular_x, circular_y);
     if (latents.empty()) {
         return {};
@@ -2892,10 +2948,46 @@ sd::Tensor<float> StableDiffusionGGML::encode_first_stage(const sd::Tensor<float
     return latents;
 }
 
+// Qwen Image 2.1's VAE (WAN) encodes deterministically - the latents are the encoder's output, nothing sampled - so an
+// example picture's latents are kept for the next request with the same picture (a re-roll: 0.5-1.1 s of VAE encode
+// on an RTX 3060 at 1024x1024, its 483 MB of weights staged again included). Keyed by the encoder's exact input (the
+// resized picture, bit for bit); not with VAE tiling or circular padding, whose settings the entries do not keep.
+sd::Tensor<float> StableDiffusionGGML::encode_reference_image(const sd::Tensor<float>& image) {
+    if (version != VERSION_QWEN_IMAGE_2_1 || image.empty() || vae_tiling_params.enabled ||
+        vae_tiling_params.temporal_tiling || circular_x || circular_y) {
+        return encode_first_stage(image);
+    }
+    for (auto& entry : reference_latents_) {
+        if (entry.image.shape() == image.shape() &&
+            std::memcmp(entry.image.data(), image.data(), static_cast<size_t>(image.numel()) * sizeof(float)) == 0) {
+            entry.used = true;
+            LOG_VERBOSE("example picture %" PRId64 "x%" PRId64 ": latents of an earlier request", image.shape()[0], image.shape()[1]);
+            return entry.latent;
+        }
+    }
+    // New example pictures: the prefix the diffusion runner keeps was computed from others.
+    drop_retained_diffusion_caches();
+    auto latent = encode_first_stage(image);
+    if (!latent.empty()) {
+        reference_latents_.push_back({image, latent, true});
+    }
+    return latent;
+}
+
+void StableDiffusionGGML::end_reference_images() {
+    reference_latents_.erase(std::remove_if(reference_latents_.begin(), reference_latents_.end(),
+                                            [](const ReferenceLatent& entry) { return !entry.used; }),
+                             reference_latents_.end());
+    for (auto& entry : reference_latents_) {
+        entry.used = false;
+    }
+}
+
 sd::Tensor<float> StableDiffusionGGML::decode_first_stage(const sd::Tensor<float>& x, bool decode_video) {
     if (sd_version_is_pid(version) || sd_version_is_minit2i(version)) {
         return sd::ops::clamp((x + 1.f) * 0.5f, 0.0f, 1.0f);
     }
+    RetainedDiffusionCacheOffer offer(*this);
     auto latents                      = first_stage_model->diffusion_to_vae_latents(x);
     auto tiling_params                = first_stage_model->resolve_tiling_params(vae_tiling_params);
     const bool prefer_temporal_tiling = decode_video && latents.dim() == 5 && latents.shape()[2] > 1 &&

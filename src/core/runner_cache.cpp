@@ -147,6 +147,12 @@ namespace sd {
         committed_.clear();
     }
 
+    void RunnerCache::retain(const std::function<bool(const std::string&)>& keep) {
+        for (auto it = committed_.begin(); it != committed_.end();) {
+            it = keep && keep(it->first) ? std::next(it) : committed_.erase(it);
+        }
+    }
+
     ggml_tensor* GraphCutTensorCache::get(const std::string& name) const {
         return cached_tensor(tensors_, name);
     }

@@ -1,6 +1,7 @@
 #ifndef __SD_CORE_RUNNER_CACHE_H__
 #define __SD_CORE_RUNNER_CACHE_H__
 
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -46,6 +47,8 @@ namespace sd {
         ggml_status capture(ggml_cgraph* graph);
         void graph_end(bool success);
         void clear();
+        // Drops the committed entries keep() rejects (outside a graph).
+        void retain(const std::function<bool(const std::string&)>& keep);
     };
 
     class GraphCutTensorCache {

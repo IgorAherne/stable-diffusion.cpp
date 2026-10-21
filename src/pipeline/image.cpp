@@ -312,12 +312,12 @@ namespace sd::pipeline {
                             resized_ref_img.shape()[1],
                             resized_ref_img.shape()[0]);
 
-                ref_latent = sd->encode_first_stage(resized_ref_img);
+                ref_latent = sd->encode_reference_image(resized_ref_img);
                 if (sd->version == VERSION_QWEN_IMAGE_2_1) {
                     ref_images[i] = std::move(resized_ref_img);
                 }
             } else {
-                ref_latent = sd->encode_first_stage(ref_images[i]);
+                ref_latent = sd->encode_reference_image(ref_images[i]);
             }
             if (ref_latent.empty()) {
                 LOG_ERROR("failed to encode reference image %d", static_cast<int>(i));
@@ -325,6 +325,9 @@ namespace sd::pipeline {
             }
 
             ref_latents.push_back(std::move(ref_latent));
+        }
+        if (!ref_latents.empty()) {
+            sd->end_reference_images();
         }
 
         if (sd_version_is_pid(sd->version)) {
