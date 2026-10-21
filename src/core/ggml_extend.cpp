@@ -785,8 +785,8 @@ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
         auto q_in = ggml_reshape_4d(ctx, ggml_ext_cont(ctx, keep_or_f32(q)), d_head, L_q, n_head, N);
         auto k_in = ggml_reshape_4d(ctx, ggml_ext_cont(ctx, keep_or_f32(k)), d_head, L_k, n_kv_head, N);
         ggml_tensor* v_in;
-        if (as_is && v->type == GGML_TYPE_F16) {
-            v_in = ggml_permute(ctx, v, 0, 2, 1, 3);  // [N, n_kv_head, L_k, d_head], a view
+        if (as_is && v->type == GGML_TYPE_F16 && v->nb[0] == ggml_type_size(v->type)) {
+            v_in = ggml_permute(ctx, v, 0, 2, 1, 3);  // [N, n_kv_head, L_k, d_head], a view (rows contiguous)
         } else {
             v_in = ggml_ext_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));
             if ((padded_head != d_head || kv_scale != 1.0f) && v_in->type != GGML_TYPE_F32) {
