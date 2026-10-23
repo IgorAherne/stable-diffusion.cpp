@@ -753,6 +753,32 @@ namespace sd::ggml_graph_cut {
         for (int node_idx : segment.internal_node_indices) {
             ggml_graph_add_node(segment_graph, ggml_graph_node(gf, node_idx));
         }
+        // ggml_graph_add_node fills neither the graph's hash set nor its use counts, which ggml_build_forward_expand
+        // would have (ggml_visit_parents): the CUDA backend's fusions ask ggml_node_get_use_count (a tensor used by
+        // exactly its fused consumers), and an unknown count of 0 turns every one of them off in segmented mode - the
+        // fused norm writers, the SCALE / SWIGLU pre-ops, the [gate | up] -> SwiGLU -> down chains (the [gate | up]
+        // product's f32 output, 403 MB at 4,096 tokens, then written in the memory-tight mode). Counted here as there:
+        // every tensor of the segment in the set, each source's uses by the segment's nodes. The set was sized for the
+        // nodes and the leaves (graph_size); a source outside both (none today) is left uncounted.
+        for (ggml_tensor* leaf : leaves) {
+            segment_graph->use_counts[ggml_hash_find_or_insert(&segment_graph->visited_hash_set, leaf)] = 0;
+        }
+        for (int i = 0; i < segment_graph->n_nodes; ++i) {
+            segment_graph->use_counts[ggml_hash_find_or_insert(&segment_graph->visited_hash_set, segment_graph->nodes[i])] = 0;
+        }
+        for (int i = 0; i < segment_graph->n_nodes; ++i) {
+            ggml_tensor* node = segment_graph->nodes[i];
+            for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                ggml_tensor* src = node->src[j];
+                if (src == nullptr) {
+                    continue;
+                }
+                const size_t pos = ggml_hash_find(&segment_graph->visited_hash_set, src);
+                if (pos != GGML_HASHSET_FULL && ggml_bitset_get(segment_graph->visited_hash_set.used, pos)) {
+                    segment_graph->use_counts[pos]++;
+                }
+            }
+        }
         *graph_ctx_out = graph_ctx;
         return segment_graph;
     }
