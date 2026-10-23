@@ -42,10 +42,12 @@ static bool sd_eval_dump_cb(struct ggml_tensor* t, bool ask, void* user_data) {
     const long long us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t_ask).count();
     FILE* f           = (FILE*)user_data;
     static int idx    = 0;
+    // SD_EVAL_DUMP_STATS=0: times only, the tensors are not read back (a profile of big graphs in seconds, not minutes)
+    static const bool stats = getenv("SD_EVAL_DUMP_STATS") == nullptr || atoi(getenv("SD_EVAL_DUMP_STATS")) != 0;
     const int64_t n   = ggml_nelements(t);
     const bool contig = ggml_is_contiguous(t);
     std::vector<float> h;
-    if (contig && n > 0 && (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16 || t->type == GGML_TYPE_BF16)) {
+    if (stats && contig && n > 0 && (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16 || t->type == GGML_TYPE_BF16)) {
         if (t->type == GGML_TYPE_F32) {
             h.resize(n);
             ggml_backend_tensor_get(t, h.data(), 0, n * sizeof(float));
