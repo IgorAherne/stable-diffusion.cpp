@@ -499,7 +499,9 @@ namespace sd::backend_fit {
             auto smaller_tile = [&](int size) {
                 int next_size = size / 2;
                 if (!tiling_params.enabled) {
-                    next_size = std::min(next_size, 256 / scale_factor);
+                    // the first retry takes the default tile (32 latent pixels: 256 image pixels at 8x, 512 at 16x),
+                    // as a requested --vae-tiling would; later retries keep halving it
+                    next_size = std::min(next_size, 32);
                 }
                 return std::min(size, std::max(4, next_size));
             };

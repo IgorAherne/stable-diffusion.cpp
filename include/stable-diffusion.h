@@ -173,7 +173,7 @@ enum lora_apply_mode_t {
 typedef struct {
     bool enabled;
     bool temporal_tiling;
-    // Spatial tile dimensions in image pixels for both encode and decode; 0 uses 256.
+    // Spatial tile dimensions in image pixels for both encode and decode; 0 uses 32 latent pixels (256 at 8x, 512 at 16x).
     int tile_size_w;
     int tile_size_h;
     float target_overlap;

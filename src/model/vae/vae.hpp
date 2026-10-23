@@ -217,7 +217,10 @@ public:
                 return false;
             }
             const int min_tile_dimension = std::min(4, static_cast<int>(latent_size));
-            double size                  = (requested_size > 0 ? requested_size : 256) / scale_factor;
+            // The default tile is 32 latent pixels (256 image pixels for an 8x VAE, 512 for a 16x one such as Wan /
+            // Qwen-Image): 256 image pixels at 16x is 16 latent pixels, inside the decoder's receptive field, and the
+            // blended seams of 50 % overlapping tiles then show as a grid of bands over the whole picture.
+            double size                  = (requested_size > 0 ? requested_size : 32 * scale_factor) / scale_factor;
             if (factor > 0.0) {
                 if (factor > 1.0) {
                     factor = 1.0 / (factor * (1.0 - tile_overlap) + tile_overlap);
