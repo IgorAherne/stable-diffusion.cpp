@@ -16,10 +16,73 @@
 // #include "preprocessing.hpp"
 #include "stable-diffusion.h"
 
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include "ggml-backend.h"
+#include "ggml.h"
+
 #include "common/common.h"
 #include "common/media_io.h"
 #include "common/resource_owners.hpp"
 #include "image_metadata.h"
+
+// Research hook, inactive unless SD_EVAL_DUMP=<file> is set: every graph node (text encoder, diffusion steps, VAE) is
+// computed one at a time and one line of statistics of its result is written - index, op, type, name, shape, count,
+// mean, rms, max |x|, three sample values, NaN count, compute time in us - to compare two backends' arithmetic op by op (e.g. a run with
+// --backend vae=cpu against the default: the first node whose line differs beyond rounding is the faulty op).
+// Non-contiguous views and non-float types are listed without statistics.
+static bool sd_eval_dump_cb(struct ggml_tensor* t, bool ask, void* user_data) {
+    static std::chrono::steady_clock::time_point t_ask;
+    if (ask) {
+        t_ask = std::chrono::steady_clock::now();
+        return true;
+    }
+    // the node's compute time (the runner synchronizes the backend before this call): a crude per-op profile
+    const long long us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t_ask).count();
+    FILE* f           = (FILE*)user_data;
+    static int idx    = 0;
+    const int64_t n   = ggml_nelements(t);
+    const bool contig = ggml_is_contiguous(t);
+    std::vector<float> h;
+    if (contig && n > 0 && (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16 || t->type == GGML_TYPE_BF16)) {
+        if (t->type == GGML_TYPE_F32) {
+            h.resize(n);
+            ggml_backend_tensor_get(t, h.data(), 0, n * sizeof(float));
+        } else {
+            std::vector<uint16_t> r(n);
+            ggml_backend_tensor_get(t, r.data(), 0, n * sizeof(uint16_t));
+            h.resize(n);
+            for (int64_t i = 0; i < n; i++) {
+                if (t->type == GGML_TYPE_F16) {
+                    h[i] = ggml_fp16_to_fp32((ggml_fp16_t)r[i]);
+                } else {
+                    ggml_bf16_t b;
+                    b.bits = r[i];
+                    h[i]   = ggml_bf16_to_fp32(b);
+                }
+            }
+        }
+    }
+    double sum = 0, sq = 0, mx = 0;
+    int64_t nans = 0;
+    for (float v : h) {
+        if (v != v) {
+            nans++;
+            continue;
+        }
+        sum += v;
+        sq += (double)v * v;
+        mx = std::max(mx, (double)std::fabs(v));
+    }
+    const int64_t m = (int64_t)h.size();
+    fprintf(f, "%d %s %s %s %lld %lld %lld %lld %lld %.9g %.9g %.9g %.9g %.9g %.9g %lld %lld\n", idx++, ggml_op_name(t->op),
+            ggml_type_name(t->type), t->name[0] ? t->name : "-", (long long)t->ne[0], (long long)t->ne[1],
+            (long long)t->ne[2], (long long)t->ne[3], (long long)m, m ? sum / m : 0.0, m ? std::sqrt(sq / m) : 0.0, mx,
+            m ? h[0] : 0.0f, m ? h[m / 2] : 0.0f, m ? h[m - 1] : 0.0f, (long long)nans, us);
+    fflush(f);
+    return true;
+}
 
 namespace fs = std::filesystem;
 
@@ -880,6 +943,12 @@ int main(int argc, const char* argv[]) {
         results.push_back(gen_params.init_image.release());
     } else {
         SDCtxPtr sd_ctx(new_sd_ctx(&sd_ctx_params));
+        if (const char* dump_path = getenv("SD_EVAL_DUMP")) {
+            FILE* dump_file = fopen(dump_path, "w");
+            if (dump_file != nullptr) {
+                sd_set_backend_eval_callback(sd_eval_dump_cb, dump_file);
+            }
+        }
 
         if (sd_ctx == nullptr) {
             LOG_INFO("new_sd_ctx_t failed");
