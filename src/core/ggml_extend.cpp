@@ -720,12 +720,14 @@ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
 
         if (strided_f32_v && !pad_head && kv_scale == 1.0f && N == 1 &&
             (v_in->type == GGML_TYPE_F32 || v_in->type == GGML_TYPE_F16) &&
-            v_in->nb[0] == ggml_type_size(v_in->type) && sd_backend_supports_cuda_mma(backend)) {
-            // CUDA's MMA/tile flash attention converts a non-F16 V to F16 itself with ggml_cuda_cast<half>, like the
-            // cast below (a permuted view of a contiguous tensor is converted in memory order and keeps its permuted
-            // strides, a view with gaps goes through to_fp16_nc), and reads V through its strides, so the permuted F32
-            // view gives the kernel the same halves without the F32 permute copy and the separate cast. An F16 V (cast
-            // by the caller, e.g. Qwen-Image 2.1's prefix-cache REUSE) is read through its strides as it is.
+            v_in->nb[0] == ggml_type_size(v_in->type) && sd_backend_is(backend, "CUDA")) {
+            // CUDA's flash attention kernels (MMA, tile, vec, and the INT8 dp4a one of the GTX 10xx) convert a non-F16
+            // V to F16 themselves with ggml_cuda_cast<half>, like the cast below (a permuted view of a contiguous
+            // tensor is converted in memory order and keeps its permuted strides, a view with gaps goes through
+            // to_fp16_nc), and read V through its strides, so the permuted F32 view gives the kernel the same halves
+            // without the F32 permute copy and the separate cast. An F16 V (cast by the caller, e.g. Qwen-Image 2.1's
+            // prefix-cache REUSE) is read through its strides as it is (on a GTX 1070 Ti the copy it replaces took
+            // 2.45 ms a block, 78 ms a 1024x1024 step).
             v_in = ggml_permute(ctx, v_in, 0, 2, 1, 3);  // [N, n_kv_head, L_k, d_head], a view
         } else {
             v_in = ggml_ext_cont(ctx, ggml_permute(ctx, v_in, 0, 2, 1, 3));
