@@ -662,27 +662,37 @@ namespace Qwen {
             return head(ctx, joint, step.time, x);
         }
 
-        // The first-block cache's graph A: the prelude and block 0. Returns h1 (block 0's output) and sets *h0 to its
-        // input, both over the whole sequence joint holds (see embed).
-        ggml_tensor* forward_first_block(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* timestep, ggml_tensor* context, const std::vector<ggml_tensor*>& refs, ggml_tensor* pe, const QwenImage21Layout& layout, const std::vector<ggml_tensor*>& masks, const QwenImage21PrefixCache& cache, ggml_tensor** h0) {
-            auto step = step_inputs(ctx, timestep, pe, layout, cache);
-            *h0       = embed(ctx, x, context, refs, layout, cache);
-            return run_blocks(ctx, *h0, step, layout, masks, cache, 0, 1);
-        }
+        int num_layers() const { return config.num_layers; }
 
-        // Graph B: blocks 1.. on h1 (graph A's output, the same sequence). Returns the drawn picture's tokens after the
-        // last block (sliced as forward slices them) and sets *time for the head.
-        ggml_tensor* forward_remaining_blocks(GGMLRunnerContext* ctx, ggml_tensor* h1, ggml_tensor* timestep, ggml_tensor* pe, const QwenImage21Layout& layout, const std::vector<ggml_tensor*>& masks, const QwenImage21PrefixCache& cache, ggml_tensor** time) {
-            auto step  = step_inputs(ctx, timestep, pe, layout, cache);
-            auto joint = run_blocks(ctx, h1, step, layout, masks, cache, 1, config.num_layers);
+        // The drawn picture's tokens of a block's output, as forward hands them to the head.
+        ggml_tensor* drawn_tokens(GGMLRunnerContext* ctx, ggml_tensor* joint, const QwenImage21Layout& layout, const QwenImage21PrefixCache& cache) {
             if (cache.mode != QwenImage21PrefixCache::Mode::REUSE) {
                 joint = ggml_ext_slice(ctx->ggml_ctx, joint, 1, layout.prefix_length, joint->ne[1]);
             }
-            *time = step.time;
             return joint;
         }
 
-        // Graph C: the head on the drawn picture's tokens (h1 + the cached residual of blocks 1..).
+        // The first-block cache's graph A: the prelude and blocks [0, head). after_block0(h0, h1) runs once block 0
+        // (input h0, output h1) is built, before the next blocks; returns the output of block head - 1. All over the
+        // whole sequence joint holds (see embed).
+        ggml_tensor* forward_first_blocks(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* timestep, ggml_tensor* context, const std::vector<ggml_tensor*>& refs, ggml_tensor* pe, const QwenImage21Layout& layout, const std::vector<ggml_tensor*>& masks, const QwenImage21PrefixCache& cache, int head, const std::function<void(ggml_tensor*, ggml_tensor*)>& after_block0) {
+            auto step = step_inputs(ctx, timestep, pe, layout, cache);
+            auto h0   = embed(ctx, x, context, refs, layout, cache);
+            auto h1   = run_blocks(ctx, h0, step, layout, masks, cache, 0, 1);
+            after_block0(h0, h1);
+            return run_blocks(ctx, h1, step, layout, masks, cache, 1, head);
+        }
+
+        // Graph B without a tail: blocks [begin, last] on graph A's output (the same sequence). Returns the drawn
+        // picture's tokens after the last block (sliced as forward slices them) and sets *time for the head.
+        ggml_tensor* forward_remaining_blocks(GGMLRunnerContext* ctx, ggml_tensor* h, ggml_tensor* timestep, ggml_tensor* pe, const QwenImage21Layout& layout, const std::vector<ggml_tensor*>& masks, const QwenImage21PrefixCache& cache, int begin, ggml_tensor** time) {
+            auto step  = step_inputs(ctx, timestep, pe, layout, cache);
+            auto joint = run_blocks(ctx, h, step, layout, masks, cache, begin, config.num_layers);
+            *time      = step.time;
+            return drawn_tokens(ctx, joint, layout, cache);
+        }
+
+        // Graph C without a tail: the head on the drawn picture's tokens (graph A's output + the cached residual).
         ggml_tensor* forward_head(GGMLRunnerContext* ctx, ggml_tensor* tokens, ggml_tensor* timestep, ggml_tensor* x) {
             return head(ctx, tokens, time_embedding(ctx, timestep), x);
         }
@@ -750,34 +760,45 @@ namespace Qwen {
 
         // ---- The first-block cache (model arg qwen_image_2_1_block_cache, environment variable SD_QWEN_BLOCK_CACHE) ----
         // The "First-Block Cache" of para-attn / WaveSpeed, a relative of TeaCache: on steps where the model's input
-        // barely changed since the last step, blocks 1..31 would add almost the same residual to block 0's output as
-        // they did on the last fully computed step, so that residual is reused instead of computed. Each step is then
-        // THREE graphs instead of one (without the cache: the single graph of forward, unchanged):
-        //   A  the prelude and block 0 on the step's latent and timestep. Persists h1 (block 0's output, the whole
-        //      sequence the step's joint holds: in STORE / uncached mode the prefix tokens first, in REUSE only the
-        //      drawn picture's) and r1 = h1 - h0 over the drawn picture's tokens (h0: block 0's input). Its output is
-        //      the indicator's two sums, sum|r1 - r1_prev| and sum|r1_prev| (r1_prev: the previous step's r1), reduced
-        //      on the card: only two floats come back.
-        //   B  (a fully computed step) h1 -> blocks 1..31 -> the head; persists D = h31 - h1 over the drawn picture's
-        //      tokens, the residual of blocks 1..31. A + B compute what the single graph computes.
-        //   C  (a skipped step) the head on h1 + D, D from the last fully computed step: costs block 0 and the head.
+        // barely changed since the last step, the middle blocks would add almost the same residual as they did on the
+        // last fully computed step, so that residual is reused instead of computed. With H blocks computed fresh at the
+        // start of every step (head, default 1) and T blocks recomputed at the end of a skipped step (tail, default 0),
+        // the cached residual covers blocks [H, 32 - T). Each step is then two graphs instead of one (without the cache:
+        // the single graph of forward, unchanged):
+        //   A  the prelude and blocks 0..H-1 on the step's latent and timestep. Persists hf (block H-1's output, the
+        //      whole sequence the step's joint holds: in STORE / uncached mode the prefix tokens first, in REUSE only the
+        //      drawn picture's) and r1 = h1 - h0, block 0's residual over the drawn picture's tokens (whatever H is).
+        //      Its output is the indicator's two sums, sum|r1 - r1_prev| and sum|r1_prev| (r1_prev: the previous
+        //      step's r1), reduced on the card: only two floats come back.
+        //   B  (a fully computed step) hf -> blocks H..31 -> the head; persists D, the residual of blocks H..31-T: over
+        //      the drawn picture's tokens when T = 0, over the whole sequence the step holds when T > 0 (the prefix
+        //      tokens' part is the same on every step: they never attend to the drawn picture and take the zero
+        //      timestep). A + B compute what the single graph computes.
+        //   C  (a skipped step) T = 0: the head on hf + D; T > 0: blocks 32-T..31 on hf + D, then the head. D is the
+        //      last fully computed step's.
         // The policy, on the host between A and B/C: ind = sum|r1 - r1_prev| / sum|r1_prev| is added up since the
         // last fully computed step; the step is skipped (C) while that sum stays below the threshold, unless it is one
         // of the first / last steps that are always computed, the cap of skipped steps in a row is reached, or there is
-        // nothing to compare with or no D yet; otherwise B, which caches the new D and resets the sum. A STORE step
-        // (the one that fills the prefix cache) is always computed fully. The sampler's steps and schedule do not
-        // change: a skipped step advances the sampler with the approximated output.
-        // Keys: one state and one set of tensors (h1, r1, D: F32, hidden x tokens, ~64 MiB each at 1024x1024) per
+        // nothing to compare with or no D yet; otherwise B, which caches the new D and resets the sum. An explicit list
+        // of steps to skip (SD_QWEN_BLOCK_CACHE_STEPS, for experiments) replaces that policy: exactly the listed steps
+        // are skipped (the indicator is still computed and logged). A STORE step (the one that fills the prefix cache)
+        // is always computed fully. The sampler's steps and schedule do not change: a skipped step advances the
+        // sampler with the approximated output.
+        // Keys: one state and one set of tensors (hf, r1, D: F32, hidden x tokens, ~64 MiB each at 1024x1024) per
         // condition, by the engine's prefix id (a run with CFG has two, each with its own indicator and decisions). The
         // state starts again with every sampling run (a re-roll, each picture of a batch); the tensors are cache
         // entries the runner does not retain, so they live on the card from step to step and go at the run's end
-        // (h1 only from A to the step's second graph; at most four of them at once, during A: h1, r1, r1_prev, D).
+        // (hf only from A to the step's second graph; at most four of them at once, during A: hf, r1, r1_prev, D).
         // Without the engine's step numbers or prefix ids (generation extensions), the step is the single graph.
         struct BlockCacheConfig {
             float threshold = 0.f;  // 0: off
             int first_full  = 2;    // steps always computed fully at the start
             int last_full   = 1;    // ... and at the end
             int max_skips   = 3;    // skipped steps in a row at most
+            int tail        = 0;    // blocks recomputed at the end of a skipped step
+            int head        = 1;    // blocks computed fresh at the start of every step
+            std::vector<int> steps; // the steps to skip, replacing the policy above (SD_QWEN_BLOCK_CACHE_STEPS)
+            bool enabled() const { return threshold > 0.f || !steps.empty(); }
         };
         BlockCacheConfig block_cache;
         enum class BlockCacheGraph {
@@ -802,8 +823,8 @@ namespace Qwen {
             return BLOCK_CACHE_ENTRY + std::to_string(prefix_id) + "." + tensor;
         }
 
-        // "<threshold>[:<first full steps>:<last full steps>:<max skips in a row>]" (',' also separates the fields,
-        // except inside --model-args, where it separates the args)
+        // "<threshold>[:<first full steps>:<last full steps>:<max skips in a row>[:<tail>[:<head>]]]" (',' also separates
+        // the fields, except inside --model-args, where it separates the args)
         static bool parse_block_cache(const std::string& text, BlockCacheConfig& config) {
             std::vector<std::string> fields(1);
             for (char c : text) {
@@ -813,20 +834,52 @@ namespace Qwen {
                     fields.back() += c;
                 }
             }
-            if (fields.size() > 4) {
+            if (fields.size() > 6) {
                 return false;
             }
             BlockCacheConfig parsed;
             if (!parse_strict_float(fields[0], parsed.threshold) || !(parsed.threshold >= 0.f) || !std::isfinite(parsed.threshold)) {
                 return false;
             }
-            int* counts[] = {&parsed.first_full, &parsed.last_full, &parsed.max_skips};
+            int* counts[] = {&parsed.first_full, &parsed.last_full, &parsed.max_skips, &parsed.tail, &parsed.head};
             for (size_t i = 1; i < fields.size(); ++i) {
                 if (!parse_strict_int(fields[i], *counts[i - 1]) || *counts[i - 1] < 0) {
                     return false;
                 }
             }
-            config = parsed;
+            parsed.steps = config.steps;
+            config       = parsed;
+            return true;
+        }
+
+        // Step numbers: "9,10,12" (' ', ':' and ';' separate them too)
+        static bool parse_step_list(const std::string& text, std::vector<int>& steps) {
+            std::vector<int> parsed;
+            std::string field;
+            auto take = [&]() {
+                if (!trim(field).empty()) {
+                    int step = 0;
+                    if (!parse_strict_int(field, step) || step < 1) {
+                        return false;
+                    }
+                    parsed.push_back(step);
+                }
+                field.clear();
+                return true;
+            };
+            for (char c : text) {
+                if (c == ',' || c == ':' || c == ';' || c == ' ') {
+                    if (!take()) {
+                        return false;
+                    }
+                } else {
+                    field += c;
+                }
+            }
+            if (!take()) {
+                return false;
+            }
+            steps = parsed;
             return true;
         }
 
@@ -900,9 +953,40 @@ namespace Qwen {
                 !parse_block_cache(block_cache_env, block_cache)) {
                 LOG_WARN("ignoring invalid SD_QWEN_BLOCK_CACHE '%s'", block_cache_env);
             }
-            if (block_cache.threshold > 0.f) {
-                LOG_INFO("Qwen Image 2.1: first-block cache on (threshold %.4g; the first %d and the last %d steps computed fully; at most %d skipped steps in a row)",
-                         block_cache.threshold, block_cache.first_full, block_cache.last_full, block_cache.max_skips);
+            // The experiments' variables (they override the matching fields of the setting above)
+            auto env_count = [](const char* name, int& value) {
+                const char* text = std::getenv(name);
+                if (text != nullptr && text[0] != '\0') {
+                    int parsed = 0;
+                    if (parse_strict_int(text, parsed) && parsed >= 0) {
+                        value = parsed;
+                    } else {
+                        LOG_WARN("ignoring invalid %s '%s'", name, text);
+                    }
+                }
+            };
+            env_count("SD_QWEN_BLOCK_CACHE_TAIL", block_cache.tail);
+            env_count("SD_QWEN_BLOCK_CACHE_HEAD", block_cache.head);
+            const char* steps_env = std::getenv("SD_QWEN_BLOCK_CACHE_STEPS");
+            if (steps_env != nullptr && steps_env[0] != '\0' && !parse_step_list(steps_env, block_cache.steps)) {
+                LOG_WARN("ignoring invalid SD_QWEN_BLOCK_CACHE_STEPS '%s'", steps_env);
+            }
+            if (block_cache.head < 1 || block_cache.head + block_cache.tail > config.num_layers) {
+                LOG_WARN("Qwen Image 2.1: first-block cache head %d / tail %d do not fit %d layers; using head 1, tail 0",
+                         block_cache.head, block_cache.tail, config.num_layers);
+                block_cache.head = 1;
+                block_cache.tail = 0;
+            }
+            if (!block_cache.steps.empty()) {
+                std::string list;
+                for (int step : block_cache.steps) {
+                    list += (list.empty() ? "" : " ") + std::to_string(step);
+                }
+                LOG_INFO("Qwen Image 2.1: first-block cache on, skipping exactly steps %s (head %d, tail %d blocks)",
+                         list.c_str(), block_cache.head, block_cache.tail);
+            } else if (block_cache.threshold > 0.f) {
+                LOG_INFO("Qwen Image 2.1: first-block cache on (threshold %.4g; the first %d and the last %d steps computed fully; at most %d skipped steps in a row; head %d, tail %d blocks)",
+                         block_cache.threshold, block_cache.first_full, block_cache.last_full, block_cache.max_skips, block_cache.head, block_cache.tail);
             }
             model.init(params_ctx, weights, prefix);
         }
@@ -1051,7 +1135,7 @@ namespace Qwen {
                 block_cache_states.clear();
                 block_cache_disabled           = false;
                 block_cache_unavailable_logged = false;
-                if (block_cache.threshold > 0.f) {
+                if (block_cache.enabled()) {
                     cache_.retain([](const std::string& name) { return !starts_with(name, BLOCK_CACHE_ENTRY); });
                     sync_runtime_residency();
                 }
@@ -1080,7 +1164,7 @@ namespace Qwen {
             }
             // The first-block cache for this call (see BlockCacheConfig): it needs the step numbers and the condition's id.
             uint64_t block_id = 0;
-            if (block_cache.threshold > 0.f && !block_cache_disabled) {
+            if (block_cache.enabled() && !block_cache_disabled) {
                 if (extra != nullptr && extra->prefix_id != 0 && extra->step > 0 && extra->steps > 0) {
                     block_id = extra->prefix_id;
                 } else if (!block_cache_unavailable_logged) {
@@ -1183,12 +1267,14 @@ namespace Qwen {
                                                 ref_inputs, pe, layout, masks, checked_cache);
                             break;
                         case BlockCacheGraph::FIRST_BLOCK: {
-                            ggml_tensor* h0 = nullptr;
-                            auto h1         = model.forward_first_block(&ctx, make_input(x), make_input(*inputs.timesteps), cached ? nullptr : make_input(context),
-                                                                        ref_inputs, pe, layout, masks, checked_cache, &h0);
-                            ctx.persist_cache_tensor(block_cache_entry(block_id, "h1"), h1);
-                            auto r1 = ggml_sub(ctx.ggml_ctx, target(h1), target(h0));
-                            ctx.persist_cache_tensor(block_cache_entry(block_id, "r1"), r1);
+                            ggml_tensor* r1 = nullptr;
+                            auto hf         = model.forward_first_blocks(&ctx, make_input(x), make_input(*inputs.timesteps), cached ? nullptr : make_input(context),
+                                                                         ref_inputs, pe, layout, masks, checked_cache, block_cache.head,
+                                                                         [&](ggml_tensor* h0, ggml_tensor* h1) {
+                                                                             r1 = ggml_sub(ctx.ggml_ctx, target(h1), target(h0));
+                                                                             ctx.persist_cache_tensor(block_cache_entry(block_id, "r1"), r1);
+                                                                         });
+                            ctx.persist_cache_tensor(block_cache_entry(block_id, "hf"), hf);
                             // (the committed r1 of the previous step; the one staged above replaces it at the graph's end)
                             auto r1_prev = block_compare ? ctx.load_cache_tensor(block_cache_entry(block_id, "r1")) : nullptr;
                             if (r1_prev != nullptr) {
@@ -1201,20 +1287,39 @@ namespace Qwen {
                             break;
                         }
                         case BlockCacheGraph::REMAINING_BLOCKS: {
-                            auto h1 = ctx.load_cache_tensor(block_cache_entry(block_id, "h1"));
-                            GGML_ASSERT(h1 != nullptr);
-                            ggml_tensor* time = nullptr;
-                            auto last         = model.forward_remaining_blocks(&ctx, h1, make_input(*inputs.timesteps), pe, layout, masks, checked_cache, &time);
-                            // D before the head, so that the head's output stays the graph's last node
-                            ctx.persist_cache_tensor(block_cache_entry(block_id, "d"), ggml_sub(ctx.ggml_ctx, last, target(h1)));
-                            out = model.head(&ctx, last, time, make_input(x));
+                            auto hf = ctx.load_cache_tensor(block_cache_entry(block_id, "hf"));
+                            GGML_ASSERT(hf != nullptr);
+                            if (block_cache.tail == 0) {
+                                ggml_tensor* time = nullptr;
+                                auto last         = model.forward_remaining_blocks(&ctx, hf, make_input(*inputs.timesteps), pe, layout, masks, checked_cache,
+                                                                                   block_cache.head, &time);
+                                // D before the head, so that the head's output stays the graph's last node
+                                ctx.persist_cache_tensor(block_cache_entry(block_id, "d"), ggml_sub(ctx.ggml_ctx, last, target(hf)));
+                                out = model.head(&ctx, last, time, make_input(x));
+                            } else {
+                                const int tail_begin = model.num_layers() - block_cache.tail;
+                                auto step            = model.step_inputs(&ctx, make_input(*inputs.timesteps), pe, layout, checked_cache);
+                                auto mid             = model.run_blocks(&ctx, hf, step, layout, masks, checked_cache, block_cache.head, tail_begin);
+                                ctx.persist_cache_tensor(block_cache_entry(block_id, "d"), ggml_sub(ctx.ggml_ctx, mid, hf));
+                                auto last = model.run_blocks(&ctx, mid, step, layout, masks, checked_cache, tail_begin, model.num_layers());
+                                out       = model.head(&ctx, model.drawn_tokens(&ctx, last, layout, checked_cache), step.time, make_input(x));
+                            }
                             break;
                         }
                         case BlockCacheGraph::HEAD: {
-                            auto h1 = ctx.load_cache_tensor(block_cache_entry(block_id, "h1"));
+                            auto hf = ctx.load_cache_tensor(block_cache_entry(block_id, "hf"));
                             auto d  = ctx.load_cache_tensor(block_cache_entry(block_id, "d"));
-                            GGML_ASSERT(h1 != nullptr && d != nullptr);
-                            out = model.forward_head(&ctx, ggml_add(ctx.ggml_ctx, target(h1), d), make_input(*inputs.timesteps), make_input(x));
+                            GGML_ASSERT(hf != nullptr && d != nullptr);
+                            if (block_cache.tail == 0) {
+                                out = model.forward_head(&ctx, ggml_add(ctx.ggml_ctx, target(hf), d), make_input(*inputs.timesteps), make_input(x));
+                            } else {
+                                // (a REUSE step holds the drawn picture's tokens only; a D cached by a STORE step, the
+                                // whole sequence, gives them its last ones)
+                                auto step = model.step_inputs(&ctx, make_input(*inputs.timesteps), pe, layout, checked_cache);
+                                auto mid  = ggml_add(ctx.ggml_ctx, hf, d->ne[1] == hf->ne[1] ? d : target(d));
+                                auto last = model.run_blocks(&ctx, mid, step, layout, masks, checked_cache, model.num_layers() - block_cache.tail, model.num_layers());
+                                out       = model.head(&ctx, model.drawn_tokens(&ctx, last, layout, checked_cache), step.time, make_input(x));
+                            }
                             break;
                         }
                     }
@@ -1236,6 +1341,19 @@ namespace Qwen {
                     return t != nullptr && t->type == GGML_TYPE_F32 && t->ne[0] == config.hidden_size && t->ne[1] == target_length &&
                            t->ne[2] == 1 && t->ne[3] == 1;
                 };
+                // D fits this step: the drawn picture's tokens without a tail; with one, the sequence this step holds,
+                // or, in REUSE, any D ending with the drawn picture's tokens
+                auto usable_d = [&]() {
+                    if (block_cache.tail == 0) {
+                        return cached_shape("d");
+                    }
+                    auto t = get_cache_tensor_by_name(block_cache_entry(block_id, "d"));
+                    const int64_t length = active_cache.mode == QwenImage21PrefixCache::Mode::REUSE
+                                               ? target_length
+                                               : static_cast<int64_t>(layout.positions.size());
+                    return t != nullptr && t->type == GGML_TYPE_F32 && t->ne[0] == config.hidden_size && t->ne[2] == 1 && t->ne[3] == 1 &&
+                           (t->ne[1] == length || (length == target_length && t->ne[1] > target_length));
+                };
                 block_compare        = cached_shape("r1");
                 const int64_t t0     = ggml_time_us();
                 auto sums            = run(active_cache, BlockCacheGraph::FIRST_BLOCK);
@@ -1247,15 +1365,23 @@ namespace Qwen {
                 if (block_compare && sums.numel() == 2) {
                     change = sums.data()[1] > 0.f ? sums.data()[0] / sums.data()[1] : INFINITY;
                 }
-                const bool forced = step <= block_cache.first_full || step > steps - block_cache.last_full ||
+                const bool listed = !block_cache.steps.empty();
+                const bool forced = listed || step <= block_cache.first_full || step > steps - block_cache.last_full ||
                                     active_cache.mode == QwenImage21PrefixCache::Mode::STORE;
                 bool skip = false;
                 if (change >= 0.f && std::isfinite(change)) {
                     state.accumulated += change;
                     skip = !forced && state.accumulated < block_cache.threshold &&
-                           state.skips_in_row < block_cache.max_skips && cached_shape("d");
+                           state.skips_in_row < block_cache.max_skips && usable_d();
                 }
-                // Fewer of these tensors on the card at once: B makes a new D, so the old one goes before it, and h1 is
+                if (listed && std::find(block_cache.steps.begin(), block_cache.steps.end(), step) != block_cache.steps.end()) {
+                    skip = active_cache.mode != QwenImage21PrefixCache::Mode::STORE && usable_d();
+                    if (!skip) {
+                        LOG_INFO("Qwen Image 2.1 first-block cache: step %d is on the list but computed fully (%s)", step,
+                                 active_cache.mode == QwenImage21PrefixCache::Mode::STORE ? "it fills the prefix cache" : "no cached residual yet");
+                    }
+                }
+                // Fewer of these tensors on the card at once: B makes a new D, so the old one goes before it, and hf is
                 // only needed until the step's second graph has run.
                 auto drop = [&](const char* tensor) {
                     const auto name = block_cache_entry(block_id, tensor);
@@ -1269,13 +1395,13 @@ namespace Qwen {
                 }
                 auto result      = run(active_cache, skip ? BlockCacheGraph::HEAD : BlockCacheGraph::REMAINING_BLOCKS);
                 const int64_t t2 = ggml_time_us();
-                drop("h1");
+                drop("hf");
                 if (result.empty()) {
                     return result;
                 }
                 LOG_VERBOSE("Qwen Image 2.1 first-block cache (condition %" PRIu64 "): step %d/%d, change %.4f, since the last full step %.4f -> %s (graph A %.0f ms, %s %.0f ms)",
                             block_id, step, steps, change, state.accumulated,
-                            skip ? "skipped" : (forced ? "computed (always)" : "computed"),
+                            skip ? "skipped" : (forced && !listed ? "computed (always)" : "computed"),
                             (t1 - t0) / 1000.0, skip ? "C" : "B", (t2 - t1) / 1000.0);
                 char text[32];
                 if (change >= 0.f) {
@@ -1296,8 +1422,9 @@ namespace Qwen {
                     for (int s : state.skipped_steps) {
                         skipped += (skipped.empty() ? "" : " ") + std::to_string(s);
                     }
-                    LOG_INFO("Qwen Image 2.1 first-block cache (condition %" PRIu64 ", threshold %.4g): %zu of %d steps skipped (%s); the change per step (* skipped):%s",
-                             block_id, block_cache.threshold, state.skipped_steps.size(), steps, skipped.c_str(), state.indicators.c_str());
+                    LOG_INFO("Qwen Image 2.1 first-block cache (condition %" PRIu64 ", %s %.4g, head %d, tail %d): %zu of %d steps skipped (%s); the change per step (* skipped):%s",
+                             block_id, listed ? "a step list, threshold" : "threshold", block_cache.threshold, block_cache.head, block_cache.tail,
+                             state.skipped_steps.size(), steps, skipped.c_str(), state.indicators.c_str());
                     state.reported = true;
                 }
                 return result;

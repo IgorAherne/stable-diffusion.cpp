@@ -521,7 +521,8 @@ ArgOptions SDContextParams::get_options() {
          "chroma_t5_mask_pad, qwen_image_zero_cond_t, qwen_image_2_1_prefix_cache, "
          "qwen_image_2_1_prefix_cache_type (auto or a type name from --type), "
          "qwen_image_2_1_prefix_cache_keep (auto, on or off), "
-         "qwen_image_2_1_block_cache (<threshold>[:<first full steps>:<last full steps>:<max skips in a row>], "
+         "qwen_image_2_1_block_cache (<threshold>[:<first full steps>:<last full steps>:<max skips in a row>"
+         "[:<tail blocks>[:<head blocks>]]], "
          "0 = off; also the environment variable SD_QWEN_BLOCK_CACHE)",
          (int)',',
          &model_args},
