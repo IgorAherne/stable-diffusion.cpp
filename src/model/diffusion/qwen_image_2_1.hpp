@@ -758,8 +758,16 @@ namespace Qwen {
         std::map<uint64_t, std::string> run_prefixes;  // this run's prefix ids -> RetainedPrefix::name
         uint64_t next_prefix_serial = 1;
 
-        // ---- The first-block cache (model arg qwen_image_2_1_block_cache, environment variable SD_QWEN_BLOCK_CACHE) ----
-        // The "First-Block Cache" of para-attn / WaveSpeed, a relative of TeaCache: on steps where the model's input
+        // ---- The First-Block Cache ----
+        // The product form (model arg qwen_image_2_1_first_block_cache=<fraction>[:<tail>], environment variable
+        // SD_QWEN_FIRST_BLOCK_CACHE read at the start of every sampling run): a fixed share of the steps reuses the
+        // cached residual of the middle blocks, on a schedule fixed by the step count (first_block_cache_schedule), with
+        // block 0 computed fresh and the last quarter of the blocks (the tail) recomputed on top of the cached residual:
+        // the fine detail, contrast and gloss come from the last blocks (GTX 1070 measurements, NOTES-block-cache.md).
+        // It runs the machinery below with the schedule as its step list, head 1 and that tail.
+        // The research knobs (model arg qwen_image_2_1_block_cache, environment variables SD_QWEN_BLOCK_CACHE,
+        // SD_QWEN_BLOCK_CACHE_STEPS / _TAIL / _HEAD, read at load; used only by runs without the product form): the
+        // "First-Block Cache" of para-attn / WaveSpeed, a relative of TeaCache: on steps where the model's input
         // barely changed since the last step, the middle blocks would add almost the same residual as they did on the
         // last fully computed step, so that residual is reused instead of computed. With H blocks computed fresh at the
         // start of every step (head, default 1) and T blocks recomputed at the end of a skipped step (tail, default 0),
@@ -800,7 +808,78 @@ namespace Qwen {
             std::vector<int> steps; // the steps to skip, replacing the policy above (SD_QWEN_BLOCK_CACHE_STEPS)
             bool enabled() const { return threshold > 0.f || !steps.empty(); }
         };
-        BlockCacheConfig block_cache;
+        BlockCacheConfig block_cache;  // the research setting, read at load
+        BlockCacheConfig run_cache;    // this sampling run's: the product form's schedule, or the research setting
+        bool run_first_block_cache = false;
+
+        struct FirstBlockCacheConfig {
+            float fraction = 0.f;  // the share of the sampling steps that reuse the cache; 0: off
+            int tail       = -1;   // the last blocks recomputed on those steps; -1: a quarter of the layers
+        };
+        FirstBlockCacheConfig first_block_cache;  // the model arg's, the default of every run
+
+        // "<fraction>[:<tail blocks>]" (',' also separates them, except inside --model-args)
+        static bool parse_first_block_cache(const std::string& text, int num_layers, FirstBlockCacheConfig& config) {
+            const auto split = text.find_first_of(":,");
+            FirstBlockCacheConfig parsed;
+            if (!parse_strict_float(text.substr(0, split), parsed.fraction) || !(parsed.fraction >= 0.f && parsed.fraction <= 1.f)) {
+                return false;
+            }
+            if (split != std::string::npos &&
+                (!parse_strict_int(text.substr(split + 1), parsed.tail) || parsed.tail < 0 || parsed.tail > num_layers - 1)) {
+                return false;
+            }
+            config = parsed;
+            return true;
+        }
+
+        // The steps of an N-step run that reuse the cache (1-based, ascending). The first W = max(2, round(0.32 N))
+        // steps and the last step are always computed; K = round(fraction N) of the slots between (W + 1 .. N - 1) reuse
+        // the cache, spread as evenly as they go: one at a time while there are at most one more of them than computed
+        // slots, else in runs separated by single computed steps, the runs as even as possible (at most 3 long while
+        // K <= 3/4 of the slots) and the longer ones nearest the middle of the slots, where a step changes the least
+        // (the later one on a tie). N = 25, fraction 0.5: W = 8, K = 13: 9-11, 13-15, 17-20, 22-24.
+        static std::vector<int> first_block_cache_schedule(float fraction, int steps) {
+            std::vector<int> cached;
+            if (!(fraction > 0.f) || steps <= 0) {
+                return cached;
+            }
+            const int warmup = std::max(2, static_cast<int>(std::floor(0.32 * steps + 0.5)));
+            const int slots  = steps - 1 - warmup;
+            const int count  = std::min(slots, static_cast<int>(std::floor(static_cast<double>(fraction) * steps + 0.5)));
+            if (slots <= 0 || count <= 0) {
+                return cached;
+            }
+            const int first    = warmup + 1;
+            const int computed = slots - count;
+            if (count <= computed + 1) {
+                for (int i = 0; i < count; ++i) {
+                    cached.push_back(first + static_cast<int>(std::floor((i + 0.5) * slots / count)));
+                }
+                return cached;
+            }
+            const int runs = computed + 1;
+            std::vector<int> length(runs, count / runs);
+            std::vector<int> order(runs);
+            for (int i = 0; i < runs; ++i) {
+                order[i] = i;
+            }
+            std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+                const double da = std::abs(a - (runs - 1) / 2.0), db = std::abs(b - (runs - 1) / 2.0);
+                return da != db ? da < db : a > b;
+            });
+            for (int i = 0; i < count % runs; ++i) {
+                ++length[order[i]];
+            }
+            int step = first;
+            for (int run = 0; run < runs; ++run, ++step) {
+                for (int i = 0; i < length[run]; ++i) {
+                    cached.push_back(step++);
+                }
+            }
+            return cached;
+        }
+
         enum class BlockCacheGraph {
             NONE,              // the whole step in one graph (forward)
             FIRST_BLOCK,       // A
@@ -914,7 +993,11 @@ namespace Qwen {
               model(config) {
             bool block_cache_set = false;
             for (const auto& [key, value] : parse_key_value_args(model_args, "model arg")) {
-                if (key == "qwen_image_2_1_block_cache") {
+                if (key == "qwen_image_2_1_first_block_cache") {
+                    if (!parse_first_block_cache(value, config.num_layers, first_block_cache)) {
+                        LOG_WARN("ignoring invalid Qwen Image 2.1 model arg '%s=%s'", key.c_str(), value.c_str());
+                    }
+                } else if (key == "qwen_image_2_1_block_cache") {
                     block_cache_set = parse_block_cache(value, block_cache);
                     if (!block_cache_set) {
                         LOG_WARN("ignoring invalid Qwen Image 2.1 model arg '%s=%s'", key.c_str(), value.c_str());
@@ -976,6 +1059,10 @@ namespace Qwen {
                          block_cache.head, block_cache.tail, config.num_layers);
                 block_cache.head = 1;
                 block_cache.tail = 0;
+            }
+            if (first_block_cache.fraction > 0.f) {
+                LOG_INFO("Qwen Image 2.1: First-Block Cache by default for %.0f %% of the steps (SD_QWEN_FIRST_BLOCK_CACHE sets it per run)",
+                         first_block_cache.fraction * 100.0);
             }
             if (!block_cache.steps.empty()) {
                 std::string list;
@@ -1131,11 +1218,36 @@ namespace Qwen {
                     prefix.used = false;
                 }
                 // The first-block cache starts again too (its tensors went at the last run's end; this is a safeguard,
-                // as its keys, the prefix ids, start again).
+                // as its keys, the prefix ids, start again). This run's setting: the product form's (the environment
+                // variable, read now, else the model arg) with its schedule for this run's step count, else the research
+                // setting.
                 block_cache_states.clear();
                 block_cache_disabled           = false;
                 block_cache_unavailable_logged = false;
-                if (block_cache.enabled()) {
+                run_cache                      = block_cache;
+                run_first_block_cache          = false;
+                FirstBlockCacheConfig product  = first_block_cache;
+                const char* product_env        = std::getenv("SD_QWEN_FIRST_BLOCK_CACHE");
+                if (product_env != nullptr && product_env[0] != '\0' && !parse_first_block_cache(product_env, config.num_layers, product)) {
+                    LOG_WARN("ignoring invalid SD_QWEN_FIRST_BLOCK_CACHE '%s'", product_env);
+                }
+                const int run_steps = extra != nullptr ? extra->steps : 0;
+                const auto schedule = first_block_cache_schedule(product.fraction, run_steps);
+                if (!schedule.empty()) {
+                    run_cache             = BlockCacheConfig();
+                    run_cache.steps       = schedule;
+                    run_cache.tail        = product.tail >= 0 ? product.tail : static_cast<int>(std::floor(config.num_layers * 0.25 + 0.5));
+                    run_first_block_cache = true;
+                    std::string list;
+                    for (int step : schedule) {
+                        list += (list.empty() ? "" : ",") + std::to_string(step);
+                    }
+                    LOG_INFO("Qwen Image 2.1: first-block cache: %zu of %d steps reuse the cached blocks 1..%d (tail %d recomputed): %s",
+                             schedule.size(), run_steps, config.num_layers - 1 - run_cache.tail, run_cache.tail, list.c_str());
+                } else if (product.fraction > 0.f) {
+                    LOG_INFO("Qwen Image 2.1: first-block cache: no step of a %d-step run reuses the cache", run_steps);
+                }
+                if (run_cache.enabled()) {
                     cache_.retain([](const std::string& name) { return !starts_with(name, BLOCK_CACHE_ENTRY); });
                     sync_runtime_residency();
                 }
@@ -1164,7 +1276,7 @@ namespace Qwen {
             }
             // The first-block cache for this call (see BlockCacheConfig): it needs the step numbers and the condition's id.
             uint64_t block_id = 0;
-            if (block_cache.enabled() && !block_cache_disabled) {
+            if (run_cache.enabled() && !block_cache_disabled) {
                 if (extra != nullptr && extra->prefix_id != 0 && extra->step > 0 && extra->steps > 0) {
                     block_id = extra->prefix_id;
                 } else if (!block_cache_unavailable_logged) {
@@ -1269,7 +1381,7 @@ namespace Qwen {
                         case BlockCacheGraph::FIRST_BLOCK: {
                             ggml_tensor* r1 = nullptr;
                             auto hf         = model.forward_first_blocks(&ctx, make_input(x), make_input(*inputs.timesteps), cached ? nullptr : make_input(context),
-                                                                         ref_inputs, pe, layout, masks, checked_cache, block_cache.head,
+                                                                         ref_inputs, pe, layout, masks, checked_cache, run_cache.head,
                                                                          [&](ggml_tensor* h0, ggml_tensor* h1) {
                                                                              r1 = ggml_sub(ctx.ggml_ctx, target(h1), target(h0));
                                                                              ctx.persist_cache_tensor(block_cache_entry(block_id, "r1"), r1);
@@ -1289,17 +1401,17 @@ namespace Qwen {
                         case BlockCacheGraph::REMAINING_BLOCKS: {
                             auto hf = ctx.load_cache_tensor(block_cache_entry(block_id, "hf"));
                             GGML_ASSERT(hf != nullptr);
-                            if (block_cache.tail == 0) {
+                            if (run_cache.tail == 0) {
                                 ggml_tensor* time = nullptr;
                                 auto last         = model.forward_remaining_blocks(&ctx, hf, make_input(*inputs.timesteps), pe, layout, masks, checked_cache,
-                                                                                   block_cache.head, &time);
+                                                                                   run_cache.head, &time);
                                 // D before the head, so that the head's output stays the graph's last node
                                 ctx.persist_cache_tensor(block_cache_entry(block_id, "d"), ggml_sub(ctx.ggml_ctx, last, target(hf)));
                                 out = model.head(&ctx, last, time, make_input(x));
                             } else {
-                                const int tail_begin = model.num_layers() - block_cache.tail;
+                                const int tail_begin = model.num_layers() - run_cache.tail;
                                 auto step            = model.step_inputs(&ctx, make_input(*inputs.timesteps), pe, layout, checked_cache);
-                                auto mid             = model.run_blocks(&ctx, hf, step, layout, masks, checked_cache, block_cache.head, tail_begin);
+                                auto mid             = model.run_blocks(&ctx, hf, step, layout, masks, checked_cache, run_cache.head, tail_begin);
                                 ctx.persist_cache_tensor(block_cache_entry(block_id, "d"), ggml_sub(ctx.ggml_ctx, mid, hf));
                                 auto last = model.run_blocks(&ctx, mid, step, layout, masks, checked_cache, tail_begin, model.num_layers());
                                 out       = model.head(&ctx, model.drawn_tokens(&ctx, last, layout, checked_cache), step.time, make_input(x));
@@ -1310,14 +1422,14 @@ namespace Qwen {
                             auto hf = ctx.load_cache_tensor(block_cache_entry(block_id, "hf"));
                             auto d  = ctx.load_cache_tensor(block_cache_entry(block_id, "d"));
                             GGML_ASSERT(hf != nullptr && d != nullptr);
-                            if (block_cache.tail == 0) {
+                            if (run_cache.tail == 0) {
                                 out = model.forward_head(&ctx, ggml_add(ctx.ggml_ctx, target(hf), d), make_input(*inputs.timesteps), make_input(x));
                             } else {
                                 // (a REUSE step holds the drawn picture's tokens only; a D cached by a STORE step, the
                                 // whole sequence, gives them its last ones)
                                 auto step = model.step_inputs(&ctx, make_input(*inputs.timesteps), pe, layout, checked_cache);
                                 auto mid  = ggml_add(ctx.ggml_ctx, hf, d->ne[1] == hf->ne[1] ? d : target(d));
-                                auto last = model.run_blocks(&ctx, mid, step, layout, masks, checked_cache, model.num_layers() - block_cache.tail, model.num_layers());
+                                auto last = model.run_blocks(&ctx, mid, step, layout, masks, checked_cache, model.num_layers() - run_cache.tail, model.num_layers());
                                 out       = model.head(&ctx, model.drawn_tokens(&ctx, last, layout, checked_cache), step.time, make_input(x));
                             }
                             break;
@@ -1344,7 +1456,7 @@ namespace Qwen {
                 // D fits this step: the drawn picture's tokens without a tail; with one, the sequence this step holds,
                 // or, in REUSE, any D ending with the drawn picture's tokens
                 auto usable_d = [&]() {
-                    if (block_cache.tail == 0) {
+                    if (run_cache.tail == 0) {
                         return cached_shape("d");
                     }
                     auto t = get_cache_tensor_by_name(block_cache_entry(block_id, "d"));
@@ -1365,16 +1477,16 @@ namespace Qwen {
                 if (block_compare && sums.numel() == 2) {
                     change = sums.data()[1] > 0.f ? sums.data()[0] / sums.data()[1] : INFINITY;
                 }
-                const bool listed = !block_cache.steps.empty();
-                const bool forced = listed || step <= block_cache.first_full || step > steps - block_cache.last_full ||
+                const bool listed = !run_cache.steps.empty();
+                const bool forced = listed || step <= run_cache.first_full || step > steps - run_cache.last_full ||
                                     active_cache.mode == QwenImage21PrefixCache::Mode::STORE;
                 bool skip = false;
                 if (change >= 0.f && std::isfinite(change)) {
                     state.accumulated += change;
-                    skip = !forced && state.accumulated < block_cache.threshold &&
-                           state.skips_in_row < block_cache.max_skips && usable_d();
+                    skip = !forced && state.accumulated < run_cache.threshold &&
+                           state.skips_in_row < run_cache.max_skips && usable_d();
                 }
-                if (listed && std::find(block_cache.steps.begin(), block_cache.steps.end(), step) != block_cache.steps.end()) {
+                if (listed && std::find(run_cache.steps.begin(), run_cache.steps.end(), step) != run_cache.steps.end()) {
                     skip = active_cache.mode != QwenImage21PrefixCache::Mode::STORE && usable_d();
                     if (!skip) {
                         LOG_INFO("Qwen Image 2.1 first-block cache: step %d is on the list but computed fully (%s)", step,
@@ -1422,9 +1534,11 @@ namespace Qwen {
                     for (int s : state.skipped_steps) {
                         skipped += (skipped.empty() ? "" : " ") + std::to_string(s);
                     }
-                    LOG_INFO("Qwen Image 2.1 first-block cache (condition %" PRIu64 ", %s %.4g, head %d, tail %d): %zu of %d steps skipped (%s); the change per step (* skipped):%s",
-                             block_id, listed ? "a step list, threshold" : "threshold", block_cache.threshold, block_cache.head, block_cache.tail,
-                             state.skipped_steps.size(), steps, skipped.c_str(), state.indicators.c_str());
+                    const auto level = run_first_block_cache ? SD_LOG_VERBOSE : SD_LOG_INFO;
+                    log_printf(level, __FILE__, __LINE__,
+                               "Qwen Image 2.1 first-block cache (condition %" PRIu64 ", %s %.4g, head %d, tail %d): %zu of %d steps skipped (%s); the change per step (* skipped):%s",
+                               block_id, listed ? "a step list, threshold" : "threshold", run_cache.threshold, run_cache.head, run_cache.tail,
+                               state.skipped_steps.size(), steps, skipped.c_str(), state.indicators.c_str());
                     state.reported = true;
                 }
                 return result;
