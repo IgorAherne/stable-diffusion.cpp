@@ -76,6 +76,12 @@ The runner accounts for the cache when checking the memory budget. If a cached e
 
 Disable this optimization with `--model-args qwen_image_2_1_prefix_cache=false`. It reuses step-independent activations; numerical results can still differ slightly because the matrix sizes change.
 
+### First-block cache
+
+`qwen_image_2_1_block_cache=<threshold>[:<first full steps>:<last full steps>:<max skips in a row>]` in `--model-args` (or the environment variable `SD_QWEN_BLOCK_CACHE` with the same value; the model arg wins) skips transformer blocks 1..31 on steps where the input barely changed (the "First-Block Cache"). Each step computes the embeddings and block 0 first and compares block 0's residual over the image tokens with the previous step's: `sum|r - r_prev| / sum|r_prev|`. While the sum of these changes since the last fully computed step stays below the threshold, the step reuses the residual of blocks 1..31 from the last fully computed step instead of computing it. The step count and the sampler are unchanged; a skipped step advances the sampler with the approximated output. Defaults: 2 first and 1 last steps always computed, at most 3 skipped steps in a row; `0` or no value turns the cache off. The fields are separated by `:` because `,` separates the model args.
+
+Without the cache, each step is the same single graph as before, so images are unchanged. With it, images change: the deviation grows with the number of skipped steps, and skipping early steps changes the composition more than skipping later ones (raise the first full steps for more skipped steps at the same quality). The state and the cached tensors (three F32 tensors of `hidden_size` x image tokens per condition, 64 MiB each at 1024x1024) are per sampling run and per condition (with CFG, the positive and negative conditions decide separately) and are released when sampling ends. The log reports the skipped steps and the per-step change once per run (`-v` prints each decision).
+
 ### Alpha channel
 
 This model supports alpha channel output. As the model determines whether to output a regular image or with transparency through the prompt, according to [official recommendation](https://github.com/QwenLM/Qwen-Image-2.1#transparent-image-generation-rgba), use the following prompt format for better results:

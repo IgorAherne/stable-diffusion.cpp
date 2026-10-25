@@ -520,7 +520,9 @@ ArgOptions SDContextParams::get_options() {
          "extra model args, key=value list. Supports chroma_use_dit_mask, chroma_use_t5_mask, "
          "chroma_t5_mask_pad, qwen_image_zero_cond_t, qwen_image_2_1_prefix_cache, "
          "qwen_image_2_1_prefix_cache_type (auto or a type name from --type), "
-         "qwen_image_2_1_prefix_cache_keep (auto, on or off)",
+         "qwen_image_2_1_prefix_cache_keep (auto, on or off), "
+         "qwen_image_2_1_block_cache (<threshold>[:<first full steps>:<last full steps>:<max skips in a row>], "
+         "0 = off; also the environment variable SD_QWEN_BLOCK_CACHE)",
          (int)',',
          &model_args},
         {"",

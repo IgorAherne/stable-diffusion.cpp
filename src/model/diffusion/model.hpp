@@ -73,6 +73,10 @@ struct QwenImage21DiffusionExtra {
     const sd::Tensor<int32_t>* image_slots = nullptr;
     // Nonzero IDs identify immutable prefix inputs within one sampling run.
     uint64_t prefix_id = 0;
+    // The sampler's step (1-based; a second evaluation within a step has the same number) and the run's step count,
+    // for the first-block cache's always-computed first and last steps (0: unknown, the cache stays off).
+    int step  = 0;
+    int steps = 0;
 };
 
 struct WanDiffusionExtra {

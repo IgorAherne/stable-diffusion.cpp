@@ -2527,7 +2527,10 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
                 diffusion_params.extra = FluxDiffusionExtra{&guidance_tensor,
                                                             local_skip_layers};
             } else if (version == VERSION_QWEN_IMAGE_2_1) {
-                diffusion_params.extra = QwenImage21DiffusionExtra{&condition.c_token_types};
+                QwenImage21DiffusionExtra qwen_extra{&condition.c_token_types};
+                qwen_extra.step        = std::abs(step);
+                qwen_extra.steps       = static_cast<int>(steps);
+                diffusion_params.extra = qwen_extra;
             } else if (sd_version_is_anima(version)) {
                 diffusion_params.extra = AnimaDiffusionExtra{condition.c_t5_ids.empty() ? nullptr : &condition.c_t5_ids,
                                                              condition.c_t5_weights.empty() ? nullptr : &condition.c_t5_weights};
