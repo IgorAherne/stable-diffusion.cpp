@@ -349,6 +349,17 @@ namespace WAN {
         }
     };
 
+    // SD_VAE_DUPUP: 0 = DupUp3D's general graph for one frame too; 1 (default) = one UPSCALE of a channel view;
+    // 2 = that, with the upsampling block's shortcut ADD taking the shortcut as its first operand (computed before the
+    // main path)
+    static int dupup_mode() {
+        static const int mode = [] {
+            const char* e = getenv("SD_VAE_DUPUP");
+            return e == nullptr ? 1 : atoi(e);
+        }();
+        return mode;
+    }
+
     class DupUp3D : public GGMLBlock {
     protected:
         int64_t in_channels;
@@ -377,7 +388,7 @@ namespace WAN {
             int64_t H = x->ne[1];
             int64_t W = x->ne[0];
 
-            if (T == 1 && (first_chunk || factor_t == 1) && ggml_is_contiguous(x)) {
+            if (T == 1 && (first_chunk || factor_t == 1) && ggml_is_contiguous(x) && dupup_mode() != 0) {
                 // One frame (a picture): the result keeps frame factor_t - 1 of the factor_t made, so
                 // out[c][Y][X] = x[cc / repeats][Y / fs][X / fs], cc = ((c * ft + ft - 1) * fs + Y % fs) * fs + X % fs
                 // (the channels' repeat_interleave, then the depth-to-space). Two patterns cover the Wan 2.2 and
@@ -645,7 +656,7 @@ namespace WAN {
                 auto avg_shortcut = std::dynamic_pointer_cast<DupUp3D>(blocks["avg_shortcut"]);
                 auto shortcut     = avg_shortcut->forward(ctx, x_copy, chunk_idx == 0, b);
 
-                x = ggml_add(ctx->ggml_ctx, x, shortcut);
+                x = dupup_mode() == 2 ? ggml_add(ctx->ggml_ctx, shortcut, x) : ggml_add(ctx->ggml_ctx, x, shortcut);
             }
 
             return x;
