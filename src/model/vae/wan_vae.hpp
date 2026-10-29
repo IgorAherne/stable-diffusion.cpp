@@ -377,7 +377,7 @@ namespace WAN {
             int64_t H = x->ne[1];
             int64_t W = x->ne[0];
 
-            if (T == 1 && (first_chunk || factor_t == 1)) {
+            if (T == 1 && (first_chunk || factor_t == 1) && ggml_is_contiguous(x)) {
                 // One frame (a picture): the result keeps frame factor_t - 1 of the factor_t made, so
                 // out[c][Y][X] = x[cc / repeats][Y / fs][X / fs], cc = ((c * ft + ft - 1) * fs + Y % fs) * fs + X % fs
                 // (the channels' repeat_interleave, then the depth-to-space). Two patterns cover the Wan 2.2 and
