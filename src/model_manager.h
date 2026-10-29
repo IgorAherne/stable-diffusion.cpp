@@ -292,6 +292,7 @@ public:
                                        const std::vector<ggml_tensor*>& required_params) const override;
     bool segmented_compute_enabled() const override { return !segmented_compute_disabled_; }
     bool prefetch_enabled() const override { return !prefetch_disabled_; }
+    bool keeps_staged_params() const override;
     void release_compute_backend_params(const std::vector<ggml_tensor*>& tensors) override;
     void evict_compute_backend_params(const std::vector<ggml_tensor*>& tensors) override;
     WeightResidencyInfo inspect_compute_backend_params(

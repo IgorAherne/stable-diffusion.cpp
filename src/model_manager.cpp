@@ -92,6 +92,27 @@ static const std::set<ModelComponent>& pinned_param_components() {
     return components;
 }
 
+// SD_KEEP_STAGED_PARAMS: when set (1 / on / true), weights copied to a GPU for a run stay there after it, for the
+// next run of the same model (a diffusion model drawing picture after picture, the text encoder for the next
+// prompt), and are evicted only when another runner's weights or working memory need the room - least recently
+// used first, before the retained caches. Unset: every run's weights leave the card at its end (upstream's way).
+bool ModelManager::keeps_staged_params() const {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SD_KEEP_STAGED_PARAMS");
+        if (value == nullptr || *value == '\0') {
+            return false;
+        }
+        std::string text = trim(value);
+        std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+        const bool on = text == "1" || text == "on" || text == "true" || text == "yes";
+        if (on) {
+            LOG_INFO("model manager keeps staged weights on the compute backend between runs (SD_KEEP_STAGED_PARAMS)");
+        }
+        return on;
+    }();
+    return enabled;
+}
+
 static bool is_pinned_host_buffer_type(ggml_backend_buffer_type_t buft) {
     if (buft == nullptr || !ggml_backend_buft_is_host(buft)) {
         return false;
@@ -203,6 +224,8 @@ bool ModelManager::set_loras(std::vector<LoraSpec> loras, SDVersion version) {
     loras_        = std::move(loras);
     lora_version_ = version;
     current_lora_epoch_++;
+    // staged copies kept from earlier runs carry the old LoRAs: they are staged afresh from the params backend
+    release_compute_staging_blocks(false);
     reset_lora_applied_params();
     return true;
 }
@@ -1929,13 +1952,21 @@ bool ModelManager::ensure_compute_backend_capacity(
     if (fits()) {
         return true;
     }
-    for (const auto& entry : workspace_reclaimers_) {
-        if (entry.first != request.owner_id) {
-            entry.second();
-            if (fits()) {
-                return true;
+    // Other runners' retained caches and idle working memory. With kept staged weights (keeps_staged_params)
+    // they are asked last: an idle model's weights come back in a copy, a dropped prefix cache in a full pass.
+    auto reclaim_others = [&]() {
+        for (const auto& entry : workspace_reclaimers_) {
+            if (entry.first != request.owner_id) {
+                entry.second();
+                if (fits()) {
+                    return true;
+                }
             }
         }
+        return false;
+    };
+    if (!keeps_staged_params() && reclaim_others()) {
+        return true;
     }
 
     std::unordered_set<TensorState*> protected_states;
@@ -2001,6 +2032,9 @@ bool ModelManager::ensure_compute_backend_capacity(
         if (release_eviction_states()) {
             return true;
         }
+    }
+    if (keeps_staged_params() && reclaim_others()) {
+        return true;
     }
 
     const auto capacity                = check_capacity(request, required_states, true);

@@ -526,7 +526,12 @@ void GGMLRunner::runner_end() {
             if (parameter != nullptr)
                 tensors.push_back(parameter);
         }
-        manager->evict_compute_backend_params(tensors);
+        if (manager->keeps_staged_params()) {
+            // unpinned, still on the card: the next run finds them there, another runner short of memory evicts them
+            manager->release_compute_backend_params(tensors);
+        } else {
+            manager->evict_compute_backend_params(tensors);
+        }
         manager->remove_runtime_owner(reinterpret_cast<uintptr_t>(this));
     }
     runner_started_ = false;
@@ -887,6 +892,15 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
         auto requests                      = memory_requests(full_measurement.buffers, cache_.pending_bytes(graph));
         for (auto& request : requests) {
             request.pending_allocation_bytes = add_bytes(request.pending_allocation_bytes, planning_headroom);
+        }
+        if (auto keeper = residency_manager.lock(); keeper != nullptr && keeper->keeps_staged_params()) {
+            // other runners' weights kept idle on the card are evicted before this graph is cut into segments
+            for (const auto& request : requests) {
+                if (!keeper->ensure_compute_backend_capacity(request, params, {}, params)) {
+                    return false;
+                }
+            }
+            return true;
         }
         return fits(requests, params);
     };

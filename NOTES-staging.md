@@ -44,3 +44,31 @@ In sd-cli on this PC the diffusion staging (page-locked) takes 0.46-0.47 s: the 
 In `code/devtools/qwen-speed` (synced to the pod with the hub's code): `CUDA_VISIBLE_DEVICES=0 python pcie_probe.py --gib 4 --idle 15`, `python pcie_wake.py --idle 12`,
 `python pcie_linger.py --cool 12` (the scripts use torch; they print the rates and nvidia-smi's link generation and
 width during each copy), and `nvidia-smi --query-gpu=pcie.link.gen.max,pcie.link.width.max --format=csv`.
+
+2026-10-29: answered on the next pod (instance 58301245, one GTX 1070): `nvidia-smi --query-gpu=pcie.link.gen.current,
+pcie.link.width.current` reads gen 3, width 2 DURING a drawing step - the host gives the card two lanes (~2 GB/s), so
+its staging of 4,005 MB takes 2.6 s whatever the power state; a user's x16 slot moves it in 0.3-0.4 s. Pod staging
+times are the pod's, not the product's.
+
+# Weights kept on the card between runs (2026-10-29, `SD_KEEP_STAGED_PARAMS`)
+
+With the offload placement (`--params-backend *=cpu`) every runner's weights were staged to the card at `runner_start`
+and evicted at `runner_end` (`GGMLRunner::runner_end` -> `evict_compute_backend_params`): the diffusion weights for
+every picture (0.3 s from page-locked RAM, 1-2 s from the file's mapping on a 16 GB PC, a disk read once the pages were
+dropped), the text encoder's for every new prompt. `SD_KEEP_STAGED_PARAMS=1` (read once, `ModelManager::
+keeps_staged_params`) makes `runner_end` only unpin them (`release_compute_backend_params`): the staged blocks stay on
+the card, the next run of that model finds them (`stage_tensors_to_compute_backend` skips staged tensors), and
+another runner short of memory evicts them in `ensure_compute_backend_capacity` - idle weights least recently used
+first (`last_use_epoch`: the text encoder before the diffusion model), the other runners' retained caches (the prefix
+cache) last; without the variable the order is upstream's (caches first, then weights) and nothing is kept, so sd-cli
+and the official behaviour are unchanged. A LoRA change (`set_loras`) frees the kept blocks: they carry the old LoRA.
+The graph planner (`GGMLRunner::compute`, `fits_monolithic`) asks the same eviction for the whole graph before it
+decides to cut the graph into segments: measured without that, the diffusion model's first step on the 8 GB
+emulation with an example picture ran in 34 segments (its weights streamed per layer, 29 s instead of 11) because
+the idle text encoder still counted as resident in the pure fit check.
+Measured through the hub on the RTX 3060 12 GB with the Turbo (text only, 8 steps): after the first picture no
+"staged compute params" line appears any more; the decode (direct convolutions, so that it fits beside the 4 GB kept)
+evicts the text encoder's blocks one by one until it fits (3.4 of 4.4 GB that day, one block stayed); a re-roll
+12.3 -> 11.8 s with the old direct conv kernel (1.8 s against the im2col decode's 1.7). An 8 GB card's decode would
+evict the diffusion weights every picture, so the hub's launcher asks for it only where the budget holds them beside
+the decode (`--keep-params auto`: 12 GB cards).
