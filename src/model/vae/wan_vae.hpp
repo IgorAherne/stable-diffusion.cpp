@@ -349,9 +349,7 @@ namespace WAN {
         }
     };
 
-    // SD_VAE_DUPUP: 0 = DupUp3D's general graph for one frame too; 1 (default) = one UPSCALE of a channel view;
-    // 2 = that, with the upsampling block's shortcut ADD taking the shortcut as its first operand (computed before the
-    // main path)
+    // SD_VAE_DUPUP=0: DupUp3D's general graph for one frame too (the control; the same values)
     static int dupup_mode() {
         static const int mode = [] {
             const char* e = getenv("SD_VAE_DUPUP");
@@ -394,8 +392,11 @@ namespace WAN {
                 // (the channels' repeat_interleave, then the depth-to-space). Two patterns cover the Wan 2.2 and
                 // Qwen-Image 2.1 decoders: the channel steps evenly with c whatever (Y % fs, X % fs) (a view of every
                 // step-th channel, upscaled), or it is c0 + step c + Y % fs (the rows from fs channels in turn: x viewed
-                // as [W, fs, H, OC], upscaled along W). One UPSCALE pass of the output's size instead of the concats and
-                // three copies of it; the same values. Other shapes take the general graph below.
+                // as [W, fs, H, OC], upscaled along W). The view is first copied contiguous (a quarter or half of the
+                // output's size), then one UPSCALE pass, instead of the concats and three copies of the output's size;
+                // the same values. (The copy also keeps the graph allocator's compute buffer at the general graph's:
+                // the upscale straight from the view measured +829 MB for the Qwen-Image 2.1 decoder at 1024^2.) Other
+                // shapes take the general graph below.
                 const int64_t ft = factor_t, fs = factor_s, OC = out_channels;
                 auto ch          = [&](int64_t c, int64_t iy, int64_t ix) {
                     return (((c * ft + ft - 1) * fs + iy) * fs + ix) / repeats;
@@ -415,12 +416,14 @@ namespace WAN {
                 if (even) {
                     ggml_tensor* xv = ggml_view_4d(ctx->ggml_ctx, x, W, H, 1, OC, x->nb[1], x->nb[2], x->nb[3] * step,
                                                    x->nb[3] * s0);
+                    xv = ggml_cont(ctx->ggml_ctx, xv);
                     return ggml_interpolate(ctx->ggml_ctx, xv, W * fs, H * fs, 1, OC, GGML_SCALE_MODE_NEAREST);
                 }
                 if (rowed) {
                     ggml_tensor* xv = ggml_view_4d(ctx->ggml_ctx, x, W, fs, H, OC, x->nb[3], x->nb[1], x->nb[3] * step,
                                                    x->nb[3] * s0);
-                    xv              = ggml_interpolate(ctx->ggml_ctx, xv, W * fs, fs, H, OC, GGML_SCALE_MODE_NEAREST);
+                    xv = ggml_interpolate(ctx->ggml_ctx, ggml_cont(ctx->ggml_ctx, xv), W * fs, fs, H, OC,
+                                          GGML_SCALE_MODE_NEAREST);
                     return ggml_reshape_4d(ctx->ggml_ctx, xv, W * fs, H * fs, 1, OC);
                 }
             }
@@ -656,7 +659,7 @@ namespace WAN {
                 auto avg_shortcut = std::dynamic_pointer_cast<DupUp3D>(blocks["avg_shortcut"]);
                 auto shortcut     = avg_shortcut->forward(ctx, x_copy, chunk_idx == 0, b);
 
-                x = dupup_mode() == 2 ? ggml_add(ctx->ggml_ctx, shortcut, x) : ggml_add(ctx->ggml_ctx, x, shortcut);
+                x = ggml_add(ctx->ggml_ctx, x, shortcut);
             }
 
             return x;
