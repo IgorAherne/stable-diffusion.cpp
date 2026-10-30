@@ -349,6 +349,15 @@ namespace WAN {
         }
     };
 
+    // SD_VAE_DUPUP=0: DupUp3D's general graph for one frame too (the control; the same values)
+    static int dupup_mode() {
+        static const int mode = [] {
+            const char* e = getenv("SD_VAE_DUPUP");
+            return e == nullptr ? 1 : atoi(e);
+        }();
+        return mode;
+    }
+
     class DupUp3D : public GGMLBlock {
     protected:
         int64_t in_channels;
@@ -376,6 +385,48 @@ namespace WAN {
             int64_t T = x->ne[2];
             int64_t H = x->ne[1];
             int64_t W = x->ne[0];
+
+            if (T == 1 && (first_chunk || factor_t == 1) && ggml_is_contiguous(x) && dupup_mode() != 0) {
+                // One frame (a picture): the result keeps frame factor_t - 1 of the factor_t made, so
+                // out[c][Y][X] = x[cc / repeats][Y / fs][X / fs], cc = ((c * ft + ft - 1) * fs + Y % fs) * fs + X % fs
+                // (the channels' repeat_interleave, then the depth-to-space). Two patterns cover the Wan 2.2 and
+                // Qwen-Image 2.1 decoders: the channel steps evenly with c whatever (Y % fs, X % fs) (a view of every
+                // step-th channel, upscaled), or it is c0 + step c + Y % fs (the rows from fs channels in turn: x viewed
+                // as [W, fs, H, OC], upscaled along W). The view is first copied contiguous (a quarter or half of the
+                // output's size), then one UPSCALE pass, instead of the concats and three copies of the output's size;
+                // the same values. (The copy also keeps the graph allocator's compute buffer at the general graph's:
+                // the upscale straight from the view measured +829 MB for the Qwen-Image 2.1 decoder at 1024^2.) Other
+                // shapes take the general graph below.
+                const int64_t ft = factor_t, fs = factor_s, OC = out_channels;
+                auto ch          = [&](int64_t c, int64_t iy, int64_t ix) {
+                    return (((c * ft + ft - 1) * fs + iy) * fs + ix) / repeats;
+                };
+                const int64_t s0    = ch(0, 0, 0);
+                const int64_t step  = OC > 1 ? ch(1, 0, 0) - s0 : 0;
+                bool          even  = step >= 0;
+                bool          rowed = step >= 0;
+                for (int64_t c = 0; c < OC && (even || rowed); c++) {
+                    for (int64_t iy = 0; iy < fs; iy++) {
+                        for (int64_t ix = 0; ix < fs; ix++) {
+                            even  = even && ch(c, iy, ix) == s0 + c * step;
+                            rowed = rowed && ch(c, iy, ix) == s0 + c * step + iy;
+                        }
+                    }
+                }
+                if (even) {
+                    ggml_tensor* xv = ggml_view_4d(ctx->ggml_ctx, x, W, H, 1, OC, x->nb[1], x->nb[2], x->nb[3] * step,
+                                                   x->nb[3] * s0);
+                    xv = ggml_cont(ctx->ggml_ctx, xv);
+                    return ggml_interpolate(ctx->ggml_ctx, xv, W * fs, H * fs, 1, OC, GGML_SCALE_MODE_NEAREST);
+                }
+                if (rowed) {
+                    ggml_tensor* xv = ggml_view_4d(ctx->ggml_ctx, x, W, fs, H, OC, x->nb[3], x->nb[1], x->nb[3] * step,
+                                                   x->nb[3] * s0);
+                    xv = ggml_interpolate(ctx->ggml_ctx, ggml_cont(ctx->ggml_ctx, xv), W * fs, fs, H, OC,
+                                          GGML_SCALE_MODE_NEAREST);
+                    return ggml_reshape_4d(ctx->ggml_ctx, xv, W * fs, H * fs, 1, OC);
+                }
+            }
 
             auto x_ = x;
             for (int64_t i = 1; i < repeats; i++) {
