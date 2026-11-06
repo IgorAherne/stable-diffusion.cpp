@@ -408,6 +408,10 @@ public:
         weight_adapter = adapter;
     }
 
+    const std::shared_ptr<WeightAdapter>& get_weight_adapter() const {
+        return weight_adapter;
+    }
+
     void set_max_graph_vram_bytes(size_t max_vram_bytes) {
         max_graph_vram_bytes = max_vram_bytes;
     }

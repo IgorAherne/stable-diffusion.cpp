@@ -81,6 +81,9 @@ struct QwenImage21DiffusionExtra {
     // for the first-block cache's always-computed first and last steps (0: unknown, the cache stays off).
     int step  = 0;
     int steps = 0;
+    // A one-off pass between two sampling runs (the albedo add-on's): no prefix or first-block cache, and the state
+    // the runner keeps for the next picture (kept prefixes, rotary tables, the run's settings) stays as it is.
+    bool isolated = false;
 };
 
 struct WanDiffusionExtra {

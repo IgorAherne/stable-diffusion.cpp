@@ -198,6 +198,8 @@ public:
 
     bool set_loader(ModelLoader loader);
     bool add_file(const std::string& path, const std::string& prefix = "", ModelLoader::FileId* id = nullptr, bool force = false);
+    // A file whose tensors stay out of the catalog: only tensors registered with its id (source_file) read it.
+    bool add_isolated_file(const std::string& path, const std::string& prefix, ModelLoader::FileId* id);
     bool del_file(ModelLoader::FileId id);
     bool refresh_files();
     ModelLoader::FileVersions source_versions(const std::set<ModelComponent>& components, const ModelLoader& loader) const;

@@ -114,6 +114,18 @@ Here are some examples ran with Q6_K quantization:
 | ![Qwen Image 2.1 alpha input example 1](../assets/qwen/qwen-image-2.1-alpha-in1.png) | This is an RGBA image with transparency. Replace the text "BLOOM" with "Qwen Image 2.1", keeping the same font of the original text. The image has alpha channel and the background is transparent. | ![Qwen Image 2.1 alpha output example 1](../assets/qwen/qwen-image-2.1-alpha-out1.png) |
 | ![Qwen Image 2.1 alpha input example 2](../assets/logo.png) | This is an RGBA image with transparency. Remove the background of the image, keeping only the text and cat. The image has alpha channel and the background is transparent. | ![Qwen Image 2.1 alpha output example 2](../assets/qwen/qwen-image-2.1-alpha-out2.png) |
 
+### Albedo add-on
+
+`sd_albedo` (and `--mode albedo` in the CLI) runs an albedo add-on trained in the manner of Marigold V2 (a LoRA on the transformer, a fine-tuned VAE decoder and a fixed prompt embedding) on the loaded model: the picture's latent (the VAE encoder's mean) goes through one transformer pass at a fixed timestep (0.498046875 on diffusers' [0, 1] scale) with the add-on's LoRA and prompt, without noise; the latent minus the prediction, decoded by the add-on's decoder, is the linear albedo, written with gamma 2.2. The LoRA runs at runtime beside the (quantized) weights for that pass only, and the pass leaves what the context keeps for the next picture (the prefix caches, the conditioning cache, the example pictures' latents) as it was.
+
+Convert a checkpoint (`trainables.safetensors`) with `scripts/convert_albedo_addon.py`: it writes `albedo_lora.safetensors` (one LoRA pair per targeted linear layer, with alpha) and `albedo_vae.safetensors` (the decoder alone, named as in `qwen_image_2.1_vae_bf16.safetensors`). The prompt embedding is a safetensors file with the tensor `prompt_embeds` [L, 4096].
+
+```powershell
+.\bin\Release\sd-cli.exe --mode albedo --diffusion-model ..\models\qwen-image-2.1-turbo-Q4_K_M.gguf --vae ..\models\qwen_image_2.1_vae_bf16.safetensors --llm ..\models\Qwen3-VL-8B-Instruct-Q4_K_M.gguf --diffusion-fa --albedo-lora albedo_lora.safetensors --albedo-condition albedo_condition.safetensors --albedo-decoder albedo_vae.safetensors -i pictures -o albedo
+```
+
+`-i` takes a picture or a folder of pictures (sides multiples of 32; `-o` is then a folder). With a prompt (`-p` and the usual generation options), that picture is drawn before the first albedo pass and after the last one, and the run fails unless the two are the same.
+
 ### Other features
 
 Other features of the model could be found on the [model card from QwenLM/Qwen-Image-2.1 repo](https://github.com/QwenLM/Qwen-Image-2.1), including 2 finetuned prompt rewriting Qwen3.5-9B model.

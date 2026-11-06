@@ -1195,7 +1195,8 @@ namespace Qwen {
                 shapes.emplace_back(ref.shape()[1], ref.shape()[0]);
             }
             shapes.emplace_back(x.shape()[1], x.shape()[0]);
-            const auto* extra = std::get_if<QwenImage21DiffusionExtra>(&inputs.extra);
+            const auto* extra   = std::get_if<QwenImage21DiffusionExtra>(&inputs.extra);
+            const bool isolated = extra != nullptr && extra->isolated;
             QwenImage21Layout layout;
             try {
                 layout = QwenImage21Layout::build(context.shape()[1], tensor_or_empty(extra ? extra->image_slots : nullptr), shapes);
@@ -1203,7 +1204,7 @@ namespace Qwen {
                 LOG_ERROR("%s", error.what());
                 return {};
             }
-            if (!runner_started()) {
+            if (!isolated && !runner_started()) {
                 // A new sampling run (sample() ends the runner after each): its prefix ids start again, and the
                 // prefixes the previous run did not use go.
                 prefix_cache_disabled = false;
@@ -1253,9 +1254,11 @@ namespace Qwen {
                 }
             }
             QwenImage21PrefixCache cache;
-            cache.f16_target_keys = prefix_cache_keep == PrefixKeep::ON && sage_attn_enabled;
+            cache.f16_target_keys = !isolated && prefix_cache_keep == PrefixKeep::ON && sage_attn_enabled;
             bool first_use        = false;
-            if (prefix_cache_enabled && !prefix_cache_disabled && extra != nullptr && extra->prefix_id != 0 && layout.prefix_length > 0) {
+            if (isolated) {
+                // (the uncached graph; the kept prefixes stay for the next picture)
+            } else if (prefix_cache_enabled && !prefix_cache_disabled && extra != nullptr && extra->prefix_id != 0 && layout.prefix_length > 0) {
                 cache.name          = resolve_prefix(extra->prefix_id, context, tensor_or_empty(extra->image_slots), refs, x, &first_use);
                 cache.prefix_length = layout.prefix_length;
                 if (prefix_cache_type != GGML_TYPE_COUNT) {
@@ -1276,7 +1279,7 @@ namespace Qwen {
             }
             // The first-block cache for this call (see BlockCacheConfig): it needs the step numbers and the condition's id.
             uint64_t block_id = 0;
-            if (run_cache.enabled() && !block_cache_disabled) {
+            if (!isolated && run_cache.enabled() && !block_cache_disabled) {
                 if (extra != nullptr && extra->prefix_id != 0 && extra->step > 0 && extra->steps > 0) {
                     block_id = extra->prefix_id;
                 } else if (!block_cache_unavailable_logged) {
@@ -1318,16 +1321,21 @@ namespace Qwen {
                     key.push_back(static_cast<double>(it->size()));
                     key.insert(key.end(), it->begin(), it->end());
                 }
+                RopeTable isolated_table;  // not kept: the next pictures' tables stay
                 RopeTable* table = nullptr;
                 for (auto& candidate : rope_tables) {
-                    if (!candidate.values.empty() && candidate.key == key) {
+                    if (!isolated && !candidate.values.empty() && candidate.key == key) {
                         table = &candidate;
                         break;
                     }
                 }
                 if (table == nullptr) {
-                    table           = &rope_tables[next_rope_table];
-                    next_rope_table = (next_rope_table + 1) % rope_tables.size();
+                    if (isolated) {
+                        table = &isolated_table;
+                    } else {
+                        table           = &rope_tables[next_rope_table];
+                        next_rope_table = (next_rope_table + 1) % rope_tables.size();
+                    }
                     table->key.clear();
                     Rope::Embedding embedding;
                     embedding.ids.assign(first_position, layout.positions.end());
@@ -1557,7 +1565,7 @@ namespace Qwen {
                 LOG_DEBUG("Qwen Image 2.1: Flash Attention unavailable; using F32 prefix caching for this sampling run");
                 result = run_step(cache);
             }
-            if (result.empty() && last_compute_status() == GGML_STATUS_ALLOC_FAILED &&
+            if (!isolated && result.empty() && last_compute_status() == GGML_STATUS_ALLOC_FAILED &&
                 (cache.mode != QwenImage21PrefixCache::Mode::NONE || !cache_.empty())) {
                 // The failed graph has ended before persistent inputs are released.
                 free_cache_ctx_and_buffer();

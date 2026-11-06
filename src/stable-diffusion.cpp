@@ -748,6 +748,26 @@ SD_API bool generate_image(sd_ctx_t* sd_ctx,
     return execution.ready && sd::pipeline::generate_image(sd_ctx->sd, params, images_out, num_images_out);
 }
 
+void sd_albedo_params_init(sd_albedo_params_t* params) {
+    *params                 = {};
+    params->lora_multiplier = 1.f;
+    // Training's 0.499 in bfloat16, the type the transformer took it in.
+    params->timestep     = 0.498046875f;
+    params->output_gamma = 2.2f;
+}
+
+SD_API sd_image_t* sd_albedo(sd_ctx_t* sd_ctx, const sd_albedo_params_t* params) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || params == nullptr) {
+        return nullptr;
+    }
+    StableDiffusionGGML::ExecutionScope execution(*sd_ctx->sd);
+    if (!execution.ready) {
+        LOG_ERROR("sd_albedo: the context is busy or its model files changed");
+        return nullptr;
+    }
+    return sd::pipeline::albedo(sd_ctx->sd, params);
+}
+
 SD_API bool generate_video(sd_ctx_t* sd_ctx,
                            const sd_vid_gen_params_t* sd_vid_gen_params,
                            sd_image_t** frames_out,

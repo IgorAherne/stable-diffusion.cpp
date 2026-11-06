@@ -18,6 +18,7 @@ enum class ModelComponent {
     Upscaler,
     Detector,
     LatentUpsampler,
+    AddonVAE,
     Count,
 };
 
@@ -55,6 +56,8 @@ inline const char* model_component_name(ModelComponent component) {
             return "YOLOv8";
         case ModelComponent::LatentUpsampler:
             return "LTX latent upsampler";
+        case ModelComponent::AddonVAE:
+            return "add-on VAE";
         case ModelComponent::Count:
             break;
     }

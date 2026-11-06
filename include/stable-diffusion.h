@@ -523,6 +523,24 @@ SD_API bool generate_image(sd_ctx_t* sd_ctx,
                            sd_image_t** images_out,
                            int* num_images_out);
 
+// The albedo add-on for Qwen Image 2.1 (a Marigold V2 style LoRA, prompt embedding and VAE decoder): one transformer
+// pass of the loaded diffusion model turns a picture into its albedo. The context's diffusion model, VAE and text
+// encoder stay as they are; the add-on's files are loaded by the first call that names them and kept for later calls.
+// A picture drawn after an albedo call is the one it would have been without it.
+typedef struct {
+    sd_image_t image;            // the picture: 3 channels, width and height multiples of 32
+    const char* lora_path;       // the add-on's LoRA (safetensors), applied at runtime for this call only
+    float lora_multiplier;       // 1.0
+    const char* condition_path;  // safetensors with the tensor "prompt_embeds" [L, 4096] (BF16 or F32), used instead of the text encoder
+    const char* decoder_path;    // the add-on's VAE decoder (decoder.* and post_quant_conv.*, named as in the Qwen Image 2.1 VAE file)
+    float timestep;              // the transformer's timestep in [0, 1] (diffusers' scale): 0.498046875
+    float output_gamma;          // the linear albedo is written as pixel = 255 * albedo^(1 / output_gamma): 2.2
+} sd_albedo_params_t;
+
+SD_API void sd_albedo_params_init(sd_albedo_params_t* params);
+// One RGB picture, freed with free_sd_images(result, 1); NULL on failure (the log says why).
+SD_API sd_image_t* sd_albedo(sd_ctx_t* sd_ctx, const sd_albedo_params_t* params);
+
 enum sd_cancel_mode_t {
     // Stop the current generation as soon as possible.
     SD_CANCEL_ALL,

@@ -16,7 +16,7 @@
 #define BOOL_STR(b) ((b) ? "true" : "false")
 
 extern const char* const modes_str[];
-#define SD_ALL_MODES_STR "img_gen, adetailer, vid_gen, convert, upscale, metadata"
+#define SD_ALL_MODES_STR "img_gen, adetailer, vid_gen, convert, upscale, metadata, albedo"
 
 enum SDMode {
     IMG_GEN,
@@ -25,6 +25,7 @@ enum SDMode {
     CONVERT,
     UPSCALE,
     METADATA,
+    ALBEDO,
     MODE_COUNT
 };
 

@@ -122,6 +122,10 @@ struct SDCliParams {
     std::string imatrix_out;
     std::vector<std::string> imatrix_in;
 
+    std::string albedo_lora;
+    std::string albedo_condition;
+    std::string albedo_decoder;
+
     bool normal_exit = false;
 
     ArgOptions get_options() {
@@ -153,6 +157,21 @@ struct SDCliParams {
              "compute the imatrix for this run and save it to the provided path",
              0,
              &imatrix_out},
+            {"",
+             "--albedo-lora",
+             "albedo mode: the add-on's LoRA (albedo_lora.safetensors)",
+             0,
+             &albedo_lora},
+            {"",
+             "--albedo-condition",
+             "albedo mode: the add-on's prompt embedding (albedo_condition.safetensors)",
+             0,
+             &albedo_condition},
+            {"",
+             "--albedo-decoder",
+             "albedo mode: the add-on's VAE decoder (albedo_vae.safetensors)",
+             0,
+             &albedo_decoder},
         };
 
         options.int_options = {
@@ -260,7 +279,9 @@ struct SDCliParams {
         options.manual_options = {
             {"-M",
              "--mode",
-             "run mode, one of [img_gen, adetailer, vid_gen, upscale, convert, metadata], default: img_gen",
+             "run mode, one of [img_gen, adetailer, vid_gen, upscale, convert, metadata, albedo], default: img_gen. "
+             "albedo: the Qwen Image 2.1 albedo add-on on --init-img (a picture, or a folder of them: -o is then a folder); "
+             "with a prompt, that picture is also drawn before and after the albedo passes (they must be the same)",
              on_mode_arg},
             {"",
              "--preview",
@@ -290,6 +311,10 @@ struct SDCliParams {
     }
 
     bool validate() {
+        if (mode == ALBEDO && (albedo_lora.empty() || albedo_condition.empty() || albedo_decoder.empty())) {
+            LOG_ERROR("error: albedo mode needs --albedo-lora, --albedo-condition and --albedo-decoder");
+            return false;
+        }
         if (mode != METADATA) {
             if (output_path.length() == 0) {
                 LOG_ERROR("error: the following arguments are required: output_path");
@@ -701,6 +726,147 @@ static bool apply_adetailer(sd_ctx_t* sd_ctx,
     return true;
 }
 
+// --mode albedo: sd_albedo on one picture or on every picture of a folder. With a prompt, that picture is drawn before
+// the first albedo pass and after the last one, and the two must be the same (the albedo passes leave the drawing's
+// state alone).
+static int run_albedo(SDCliParams& cli_params, SDContextParams& ctx_params, SDGenerationParams& gen_params) {
+    if (gen_params.init_image_path.empty()) {
+        LOG_ERROR("albedo mode needs a picture or a folder of pictures (--init-img)");
+        return 1;
+    }
+    const fs::path input  = fs::u8path(gen_params.init_image_path);
+    const fs::path output = fs::u8path(cli_params.output_path);
+    std::vector<std::pair<fs::path, fs::path>> jobs;
+    if (fs::is_directory(input)) {
+        for (const auto& entry : fs::directory_iterator(input)) {
+            std::string ext = entry.path().extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+            if (entry.is_regular_file() && (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".webp")) {
+                jobs.push_back({entry.path(), output / entry.path().stem().concat(".png")});
+            }
+        }
+        std::sort(jobs.begin(), jobs.end());
+        fs::create_directories(output);
+    } else {
+        jobs.push_back({input, output});
+    }
+    if (jobs.empty()) {
+        LOG_ERROR("no pictures in '%s'", gen_params.init_image_path.c_str());
+        return 1;
+    }
+
+    const bool draw = !gen_params.prompt.empty();
+    if (draw) {
+        gen_params.ref_images.clear();
+        for (const auto& path : gen_params.ref_image_paths) {
+            SDImageOwner ref_image({0, 0, 0, nullptr});
+            if (!load_sd_image_from_file(ref_image.put(), path.c_str(), 0, 0, 0)) {
+                LOG_ERROR("load image from '%s' failed", path.c_str());
+                return 1;
+            }
+            gen_params.ref_images.push_back(std::move(ref_image));
+        }
+        gen_params.set_width_and_height_if_unset(1024, 1024);
+        if (gen_params.seed < 0) {
+            gen_params.seed = 42;
+        }
+    }
+
+    sd_ctx_params_t sd_ctx_params = ctx_params.to_sd_ctx_params_t(cli_params.taesd_preview);
+    SDCtxPtr sd_ctx(new_sd_ctx(&sd_ctx_params));
+    if (sd_ctx == nullptr) {
+        LOG_ERROR("new_sd_ctx_t failed");
+        return 1;
+    }
+    if (const char* dump_path = getenv("SD_EVAL_DUMP")) {
+        FILE* dump_file = fopen(dump_path, "w");
+        if (dump_file != nullptr) {
+            sd_set_backend_eval_callback(sd_eval_dump_cb, dump_file);
+        }
+    }
+
+    auto draw_picture = [&](const char* label) -> std::vector<uint8_t> {
+        if (gen_params.sample_params.sample_method == SAMPLE_METHOD_COUNT) {
+            gen_params.sample_params.sample_method = sd_get_default_sample_method(sd_ctx.get());
+        }
+        if (gen_params.sample_params.scheduler == SCHEDULER_COUNT) {
+            gen_params.sample_params.scheduler = sd_get_default_scheduler(sd_ctx.get(), gen_params.sample_params.sample_method);
+        }
+        sd_img_gen_params_t img_gen_params = gen_params.to_sd_img_gen_params_t();
+        img_gen_params.batch_count         = 1;
+        sd_image_t* images                 = nullptr;
+        int count                          = 0;
+        std::vector<uint8_t> pixels;
+        const auto t0 = std::chrono::steady_clock::now();
+        if (generate_image(sd_ctx.get(), &img_gen_params, &images, &count) && count == 1 && images[0].data != nullptr) {
+            const sd_image_t& image = images[0];
+            pixels.assign(image.data, image.data + static_cast<size_t>(image.width) * image.height * image.channel);
+            fs::path path = fs::is_directory(output) ? output / (std::string("gen_") + label + ".png")
+                                                     : fs::path(output).replace_filename(output.stem().string() + "_gen_" + label + ".png");
+            write_image_to_file(path.string(), image.data, image.width, image.height, image.channel);
+            LOG_INFO("drawn %s the albedo passes in %.2fs: %s", label,
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), path.string().c_str());
+        }
+        free_sd_images(images, count);
+        return pixels;
+    };
+
+    std::vector<uint8_t> before;
+    if (draw) {
+        before = draw_picture("before");
+        if (before.empty()) {
+            LOG_ERROR("drawing the picture failed");
+            return 1;
+        }
+    }
+
+    sd_albedo_params_t params;
+    sd_albedo_params_init(&params);
+    params.lora_path      = cli_params.albedo_lora.c_str();
+    params.condition_path = cli_params.albedo_condition.c_str();
+    params.decoder_path   = cli_params.albedo_decoder.c_str();
+    for (const auto& [in_path, out_path] : jobs) {
+        SDImageOwner image({0, 0, 0, nullptr});
+        if (!load_sd_image_from_file(image.put(), in_path.string().c_str(), 0, 0, 3)) {
+            LOG_ERROR("load image from '%s' failed", in_path.string().c_str());
+            return 1;
+        }
+        params.image         = image.get();
+        const auto t0        = std::chrono::steady_clock::now();
+        sd_image_t* result   = sd_albedo(sd_ctx.get(), &params);
+        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (result == nullptr) {
+            LOG_ERROR("albedo of '%s' failed", in_path.string().c_str());
+            return 1;
+        }
+        const bool written = write_image_to_file(out_path.string(), result->data, result->width, result->height, result->channel);
+        free_sd_images(result, 1);
+        if (!written) {
+            LOG_ERROR("cannot write '%s'", out_path.string().c_str());
+            return 1;
+        }
+        LOG_INFO("albedo %s -> %s (%.2fs)", in_path.string().c_str(), out_path.string().c_str(), seconds);
+    }
+
+    if (draw) {
+        const auto after = draw_picture("after");
+        if (after.empty()) {
+            LOG_ERROR("drawing the picture again failed");
+            return 1;
+        }
+        if (after != before) {
+            size_t differ = 0;
+            for (size_t i = 0; i < std::min(before.size(), after.size()); ++i) {
+                differ += before[i] != after[i];
+            }
+            LOG_ERROR("the picture drawn after the albedo passes differs from the one before (%zu bytes)", differ);
+            return 1;
+        }
+        LOG_INFO("the picture drawn after the albedo passes is the one drawn before them, byte for byte");
+    }
+    return 0;
+}
+
 int main(int argc, const char* argv[]) {
     if (argc > 1 && std::string(argv[1]) == "--version") {
         std::cout << version_string() << "\n";
@@ -805,6 +971,10 @@ int main(int argc, const char* argv[]) {
                      cli_params.output_path.c_str());
             return 0;
         }
+    }
+
+    if (cli_params.mode == ALBEDO) {
+        return run_albedo(cli_params, ctx_params, gen_params);
     }
 
     auto load_image_and_update_size = [&](const std::string& path,

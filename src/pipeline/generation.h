@@ -63,6 +63,9 @@ namespace sd::pipeline {
                         sd_audio_t** audio_out,
                         int* fps_out);
 
+    // sd_albedo (albedo.cpp). Callers hold ExecutionScope.
+    sd_image_t* albedo(StableDiffusionGGML* sd, const sd_albedo_params_t* params);
+
     sd::Tensor<float> upscale_ltx_spatial_video_latent(StableDiffusionGGML* sd,
                                                        const char* model_path,
                                                        const sd::Tensor<float>& packed_latent,

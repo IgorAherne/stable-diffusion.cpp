@@ -242,6 +242,7 @@ void StableDiffusionGGML::drop_retained_diffusion_caches() {
 }
 
 bool StableDiffusionGGML::reset_runners(const RunnerGroups& groups) {
+    albedo_addon_.reset();
     clear_generation_caches();
     conditioning_loras_.clear();
     end_runners();

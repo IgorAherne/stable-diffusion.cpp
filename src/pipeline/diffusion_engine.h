@@ -23,6 +23,7 @@
 #include "stable-diffusion.h"
 
 class RNG;
+struct AlbedoAddon;
 struct Denoiser;
 struct LoraModel;
 struct ConditionerParams;
@@ -188,6 +189,8 @@ public:
         bool used = false;
     };
     std::vector<ReferenceLatent> reference_latents_;
+    // The albedo add-on's LoRA, prompt and decoder, loaded by the first sd_albedo call that names them (albedo.cpp).
+    std::shared_ptr<AlbedoAddon> albedo_addon_;
     bool executing_ = false;
 
     std::shared_ptr<Denoiser> denoiser;

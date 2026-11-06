@@ -58,6 +58,9 @@ namespace sd::model_builders {
 
     bool build_core_runners(const Context& ctx, CoreRunners& runners);
     bool build_vae_runners(const Context& ctx, const VAEOptions& options, VAERunners& runners);
+    // A decode-only VAE of the context's model on ctx.tensor_storage_map (an add-on's own decoder), set up like the
+    // context's VAE; nullptr where the model's VAE has no such form.
+    std::shared_ptr<VAE> build_vae_decoder(const Context& ctx);
     bool build_control_net_runner(const Context& ctx, std::shared_ptr<ControlNet>& runner);
     bool build_extension_runners(const GenerationExtensionInitContext& ctx,
                                  std::vector<std::shared_ptr<GenerationExtension>>& extensions);

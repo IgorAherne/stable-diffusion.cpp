@@ -129,6 +129,18 @@ bool ModelManager::add_file(const std::string& path, const std::string& prefix, 
     return true;
 }
 
+bool ModelManager::add_isolated_file(const std::string& path, const std::string& prefix, ModelLoader::FileId* id) {
+    ModelLoader candidate = model_loader_;
+    ModelLoader::FileId added_id;
+    if (!candidate.add_file(path, prefix, &added_id, false, ModelLoader::FileScope::Isolated) || !set_loader(std::move(candidate))) {
+        return false;
+    }
+    if (id != nullptr) {
+        *id = added_id;
+    }
+    return true;
+}
+
 bool ModelManager::del_file(ModelLoader::FileId id) {
     ModelLoader candidate = model_loader_;
     return candidate.del_file(id) && set_loader(std::move(candidate));

@@ -672,6 +672,27 @@ namespace sd::model_builders {
         return true;
     }
 
+    std::shared_ptr<VAE> build_vae_decoder(const Context& ctx) {
+        if (ctx.version != VERSION_QWEN_IMAGE_2_1 || !ensure_backend_pair(ctx.backends, SDBackendModule::VAE)) {
+            return nullptr;
+        }
+        auto vae = std::make_shared<WAN::WanVAERunner>(ctx.backends.runtime_backend(SDBackendModule::VAE),
+                                                       ctx.tensor_storage_map,
+                                                       "first_stage_model",
+                                                       true,
+                                                       ctx.version,
+                                                       ctx.weight_manager);
+        if (ctx.params.flash_attn) {
+            vae->set_flash_attention_enabled(true);
+        }
+        if (ctx.params.vae_conv_direct) {
+            vae->set_conv2d_direct_enabled(true);
+            vae->set_conv3d_direct_enabled(true);
+        }
+        vae->set_scale_overrides(ctx.params.linear_scale, ctx.params.attn_scale);
+        return vae;
+    }
+
     bool build_control_net_runner(const Context& ctx, std::shared_ptr<ControlNet>& runner) {
         const auto* sd_ctx_params      = &ctx.params;
         const auto& tensor_storage_map = ctx.tensor_storage_map;
