@@ -1565,16 +1565,21 @@ namespace Qwen {
                 LOG_DEBUG("Qwen Image 2.1: Flash Attention unavailable; using F32 prefix caching for this sampling run");
                 result = run_step(cache);
             }
-            if (!isolated && result.empty() && last_compute_status() == GGML_STATUS_ALLOC_FAILED &&
+            if (result.empty() && last_compute_status() == GGML_STATUS_ALLOC_FAILED &&
                 (cache.mode != QwenImage21PrefixCache::Mode::NONE || !cache_.empty())) {
                 // The failed graph has ended before persistent inputs are released.
                 free_cache_ctx_and_buffer();
-                prefix_cache_disabled = true;
-                if (block_id != 0) {
-                    block_cache_disabled = true;
-                    LOG_WARN("Qwen Image 2.1: insufficient memory for the first-block cache; retrying without it (and without prefix caching) for this sampling run");
+                if (isolated) {
+                    // The kept prefixes go: the next picture computes its prefix again (the same picture, see PrefixKeep).
+                    LOG_WARN("Qwen Image 2.1: insufficient memory for this pass beside the kept prefixes; retrying without them");
                 } else {
-                    LOG_WARN("Qwen Image 2.1: insufficient memory for prefix caching; retrying without it for this sampling run");
+                    prefix_cache_disabled = true;
+                    if (block_id != 0) {
+                        block_cache_disabled = true;
+                        LOG_WARN("Qwen Image 2.1: insufficient memory for the first-block cache; retrying without it (and without prefix caching) for this sampling run");
+                    } else {
+                        LOG_WARN("Qwen Image 2.1: insufficient memory for prefix caching; retrying without it for this sampling run");
+                    }
                 }
                 QwenImage21PrefixCache uncached;
                 uncached.f16_target_keys = cache.f16_target_keys;

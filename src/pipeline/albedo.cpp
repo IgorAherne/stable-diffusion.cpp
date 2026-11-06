@@ -44,7 +44,8 @@ struct AlbedoAddon {
     void release_decoder() {
         if (decoder != nullptr) {
             decoder->runner_end();
-            manager->unregister_param_tensors(decoder_params);
+            // (a decoder tensor left registered would keep pointing into the freed runner, as ~LoraModel)
+            GGML_ASSERT(manager->unregister_param_tensors(decoder_params));
         }
         decoder.reset();
         decoder_params.clear();

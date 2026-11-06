@@ -526,7 +526,8 @@ SD_API bool generate_image(sd_ctx_t* sd_ctx,
 // The albedo add-on for Qwen Image 2.1 (a Marigold V2 style LoRA, prompt embedding and VAE decoder): one transformer
 // pass of the loaded diffusion model turns a picture into its albedo. The context's diffusion model, VAE and text
 // encoder stay as they are; the add-on's files are loaded by the first call that names them and kept for later calls.
-// A picture drawn after an albedo call is the one it would have been without it.
+// A picture drawn after an albedo call is the one it would have been without it. The call runs to its end (seconds):
+// sd_cancel_generation does not stop it, and the add-on's files are read again only when a path changes.
 typedef struct {
     sd_image_t image;            // the picture: 3 channels, width and height multiples of 32
     const char* lora_path;       // the add-on's LoRA (safetensors), applied at runtime for this call only

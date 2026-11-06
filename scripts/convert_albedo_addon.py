@@ -107,7 +107,8 @@ def main():
     if leftover:
         sys.exit(f"tensors neither LoRA nor decoder: {leftover[:5]}")
 
-    meta = {"source": args.trainables.name, "format": "sd.cpp albedo add-on"}
+    # one metadata entry: safetensors writes several in hash order, which changed the header between runs
+    meta = {"format": f"sd.cpp albedo add-on from {args.trainables.name}"}
     args.out_dir.mkdir(parents=True, exist_ok=True)
     save_file(lora, str(lora_out), metadata=meta)
     save_file(decoder, str(vae_out), metadata=meta)
