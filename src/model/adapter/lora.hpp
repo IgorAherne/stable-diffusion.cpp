@@ -860,7 +860,8 @@ struct LoraModel : public GGMLRunner {
                                       forward_params.conv2d.scale);
             }
 
-            auto curr_out_diff = ggml_ext_scale(ctx, lx, scale_value, true);
+            // (x * 1 is x: no pass over the product for the usual alpha = rank)
+            auto curr_out_diff = scale_value == 1.0f ? lx : ggml_ext_scale(ctx, lx, scale_value, true);
             if (out_diff == nullptr) {
                 out_diff = curr_out_diff;
             } else {

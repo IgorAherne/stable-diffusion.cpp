@@ -394,7 +394,22 @@ bool ModelManager::unregister_tensor_states(const std::unordered_set<TensorState
     }
 
     clear_all_prefetched_params();
-    release_compute_staging_blocks(false, &target_states);
+    // A staging block holds what one graph staged, at times of several registrations (a runtime LoRA beside its
+    // model's weights, kept on the card with SD_KEEP_STAGED_PARAMS): it goes as a whole, and the others' tensors in it
+    // are staged again where they are used next.
+    std::unordered_set<TensorState*> staged_states = target_states;
+    for (const auto& block : compute_staging_blocks_) {
+        const auto& staged = block->staged_tensors;
+        if (std::any_of(staged.begin(), staged.end(), [&](const auto& pair) { return pair.first != nullptr && target_states.count(pair.first) > 0; }) &&
+            std::all_of(staged.begin(), staged.end(), [](const auto& pair) { return pair.first == nullptr || pair.first->pin_count == 0; })) {
+            for (const auto& pair : staged) {
+                if (pair.first != nullptr) {
+                    staged_states.insert(pair.first);
+                }
+            }
+        }
+    }
+    release_compute_staging_blocks(false, &staged_states);
 
     std::vector<ParamsStorageBlock*> storage_blocks_to_release;
     std::unordered_set<TensorState*> affected_storage_states;
