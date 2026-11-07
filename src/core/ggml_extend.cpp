@@ -638,6 +638,9 @@ ggml_tensor* ggml_ext_cast_f32(ggml_context* ctx, ggml_backend_t backend, ggml_t
         // auto out = ggml_cast(ctx, a, GGML_TYPE_F32);
         return out;
     } else {
+        if (ggml_is_quantized(a->type)) {
+            return ggml_cast(ctx, a, GGML_TYPE_F32);  // a block type cannot be reshaped to one column
+        }
         auto out         = ggml_reshape_2d(ctx, a, 1, ggml_nelements(a));
         ggml_tensor* one = ggml_ext_ones(ctx, 1, 1, 1, 1);  // [1,]
         if (ggml_is_transposed(out)) {

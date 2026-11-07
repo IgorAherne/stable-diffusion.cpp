@@ -824,8 +824,8 @@ struct LoraModel : public GGMLRunner {
 
             ggml_tensor* lx;
             if (!is_conv2d) {
-                // the scale keeps F16 products in range: other weights need no passes over x and the product for it
-                // (and the models' power-of-two scales are exact, so skipping them changes no bits)
+                // the scale only keeps F16 products in range; for other types it is two passes (exact, a power of two)
+                // over x and the product for nothing
                 auto scale_for = [&](ggml_tensor* w) { return w->type == GGML_TYPE_F16 ? forward_params.linear.scale : 1.f; };
                 lx = ggml_ext_linear(ctx, x, lora_down, nullptr, forward_params.linear.force_prec_f32, scale_for(lora_down));
                 if (lora_mid) {
