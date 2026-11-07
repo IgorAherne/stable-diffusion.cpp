@@ -70,7 +70,7 @@ struct LoraModel : public GGMLRunner {
             if (filter && !filter(name))
                 continue;
             const bool scalar  = source.nelements() == 1 && (ends_with(name, ".alpha") || ends_with(name, ".scale"));
-            auto* tensor       = ggml_new_tensor(params_ctx, scalar ? GGML_TYPE_F32 : source.type, source.n_dims, source.ne);
+            auto* tensor       = ggml_new_tensor(params_ctx, scalar ? GGML_TYPE_F32 : stored_type(name, source), source.n_dims, source.ne);
             lora_tensors[name] = tensor;
             if (scalar) {
                 tensor->data  = &scalar_values[tensor];
@@ -97,6 +97,22 @@ struct LoraModel : public GGMLRunner {
         for (const auto& entry : tensors)
             registered_params.push_back(entry.second);
         return model_manager->validate_registered_tensors();
+    }
+
+    // SD_LORA_WEIGHT_TYPE=q8_0 (Spellcast3D sets it on cards without BF16 tensor cores: GTX 10xx, RTX 20xx): a linear
+    // LoRA's matrices are converted to Q8_0 as they load, so its products take ggml's int8 kernels instead of cuBLAS
+    // in F32, at half the memory.
+    static ggml_type stored_type(const std::string& name, const TensorStorage& source) {
+        static const bool q8_0 = [] {
+            const char* value = getenv("SD_LORA_WEIGHT_TYPE");
+            return value != nullptr && std::string(value) == "q8_0";
+        }();
+        const bool floats = source.type == GGML_TYPE_BF16 || source.type == GGML_TYPE_F16 || source.type == GGML_TYPE_F32;
+        const bool linear = source.n_dims == 2 && (ends_with(name, ".lora_down") || ends_with(name, ".lora_up"));
+        if (q8_0 && floats && linear && source.ne[0] % ggml_blck_size(GGML_TYPE_Q8_0) == 0) {
+            return GGML_TYPE_Q8_0;
+        }
+        return source.type;
     }
 
     float scalar_value(ggml_tensor* tensor) const {
@@ -808,11 +824,14 @@ struct LoraModel : public GGMLRunner {
 
             ggml_tensor* lx;
             if (!is_conv2d) {
-                lx = ggml_ext_linear(ctx, x, lora_down, nullptr, forward_params.linear.force_prec_f32, forward_params.linear.scale);
+                // the scale keeps F16 products in range: other weights need no passes over x and the product for it
+                // (and the models' power-of-two scales are exact, so skipping them changes no bits)
+                auto scale_for = [&](ggml_tensor* w) { return w->type == GGML_TYPE_F16 ? forward_params.linear.scale : 1.f; };
+                lx = ggml_ext_linear(ctx, x, lora_down, nullptr, forward_params.linear.force_prec_f32, scale_for(lora_down));
                 if (lora_mid) {
-                    lx = ggml_ext_linear(ctx, lx, lora_mid, nullptr, forward_params.linear.force_prec_f32, forward_params.linear.scale);
+                    lx = ggml_ext_linear(ctx, lx, lora_mid, nullptr, forward_params.linear.force_prec_f32, scale_for(lora_mid));
                 }
-                lx = ggml_ext_linear(ctx, lx, lora_up, nullptr, forward_params.linear.force_prec_f32, forward_params.linear.scale);
+                lx = ggml_ext_linear(ctx, lx, lora_up, nullptr, forward_params.linear.force_prec_f32, scale_for(lora_up));
             } else {  // OP_CONV2D
                 lx = ggml_ext_conv_2d(ctx,
                                       x,

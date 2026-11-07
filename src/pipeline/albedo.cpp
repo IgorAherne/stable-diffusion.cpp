@@ -33,6 +33,11 @@ struct AlbedoAddon {
     std::shared_ptr<VAE> decoder;
     std::vector<ggml_tensor*> decoder_params;
     size_t decoder_bytes = 0;
+    // The tiles the last decode needed and its latent's size: SuperTexture decodes view after view of one size, and
+    // each would otherwise run out of memory in one piece before retrying in tiles (~2 s on a 6 GB RTX 20xx).
+    sd_tiling_params_t decode_tiling = {false, false, 0, 0, 0.5f, 0.f, 0.f, nullptr};
+    int64_t decode_tiling_w          = 0;
+    int64_t decode_tiling_h          = 0;
 
     void release_lora() {
         adapter.reset();
@@ -50,7 +55,8 @@ struct AlbedoAddon {
         decoder.reset();
         decoder_params.clear();
         decoder_path.clear();
-        decoder_bytes = 0;
+        decoder_bytes   = 0;
+        decode_tiling_w = decode_tiling_h = 0;
     }
 
     ~AlbedoAddon() {
@@ -339,20 +345,30 @@ namespace sd::pipeline {
             return vae->vae_to_diffusion_latents(vae->vae_output_to_latents(latents, sd->rng));
         }
 
-        sd::Tensor<float> decode(StableDiffusionGGML* sd, VAE& decoder, const sd::Tensor<float>& x) {
+        sd::Tensor<float> decode(StableDiffusionGGML* sd, AlbedoAddon& addon, const sd::Tensor<float>& x) {
             DiffusionCacheOffer offer(sd->diffusion_model);
-            auto latents              = decoder.diffusion_to_vae_latents(x);
-            sd_tiling_params_t tiling = {false, false, 0, 0, 0.5f, 0.f, 0.f, nullptr};
-            int tile_size_w           = static_cast<int>(latents.shape()[0]);
-            int tile_size_h           = static_cast<int>(latents.shape()[1]);
+            VAE& decoder = *addon.decoder;
+            auto latents     = decoder.diffusion_to_vae_latents(x);
+            const int64_t lw = latents.shape()[0], lh = latents.shape()[1];
+            // a picture of the size the last call decoded starts in the tiles that one needed
+            sd_tiling_params_t tiling = addon.decode_tiling_w == lw && addon.decode_tiling_h == lh
+                                            ? addon.decode_tiling
+                                            : sd_tiling_params_t{false, false, 0, 0, 0.5f, 0.f, 0.f, nullptr};
+            int tile_size_w = static_cast<int>(lw);
+            int tile_size_h = static_cast<int>(lh);
             for (;;) {
                 float overlap = 0.f;
-                if (tiling.enabled && !decoder.get_tile_sizes(tile_size_w, tile_size_h, overlap, tiling, latents.shape()[0], latents.shape()[1])) {
+                if (tiling.enabled && !decoder.get_tile_sizes(tile_size_w, tile_size_h, overlap, tiling, lw, lh)) {
                     return {};
                 }
                 auto decoded = decoder.decode(sd->n_threads, latents, tiling);
-                if (!decoded.empty() ||
-                    !sd::backend_fit::prepare_vae_decode_retry_tiling(tiling, false, decoder.last_compute_status(),
+                if (!decoded.empty()) {
+                    addon.decode_tiling   = tiling;
+                    addon.decode_tiling_w = lw;
+                    addon.decode_tiling_h = lh;
+                    return decoded;
+                }
+                if (!sd::backend_fit::prepare_vae_decode_retry_tiling(tiling, false, decoder.last_compute_status(),
                                                                       tile_size_w, tile_size_h, decoder.get_scale_factor())) {
                     return decoded;
                 }
@@ -452,7 +468,7 @@ namespace sd::pipeline {
         }
         const int64_t t_dit = ggml_time_ms();
 
-        auto decoded = decode(sd, *addon.decoder, latent - prediction);
+        auto decoded = decode(sd, addon, latent - prediction);
         if (decoded.empty() || decoded.shape()[0] != W || decoded.shape()[1] != H || decoded.shape()[2] < 3) {
             LOG_ERROR("albedo: decode failed");
             return nullptr;
