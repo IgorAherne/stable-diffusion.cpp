@@ -799,6 +799,10 @@ namespace Qwen {
         // without the drawn picture's rows, which they never attend to. The pass is ~40 % smaller than a STORE graph
         // (no drawn picture's rows), so it is cut into fewer layer segments where memory is short, and the step after
         // it fits whole as every later step does. SD_QWEN_PREFIX_PASS=0 (read per sampling run) keeps the STORE step.
+        // Only for a prefix at least as long as the drawn picture: the products then take at least as many rows as a
+        // REUSE step's do, whose rows the kept prefix already relies on matching a STORE step's. Fewer rows can take
+        // other kernels (the W8A8 int8 products start at 1,024; a text-only prompt's ~60 rows went through the k-quant
+        // ones and changed the picture).
         bool prefix_pass_enabled = true;
 
         // The prefixes whose K/V the cache holds, with copies of everything those were computed from (when kept):
@@ -1621,7 +1625,8 @@ namespace Qwen {
             auto run_step = [&](const QwenImage21PrefixCache& active_cache) {
                 return block_id != 0 ? run_block_cached(active_cache) : run(active_cache, BlockCacheGraph::NONE);
             };
-            if (cache.mode == QwenImage21PrefixCache::Mode::STORE && prefix_pass_enabled && block_id == 0 && keep_prefixes()) {
+            if (cache.mode == QwenImage21PrefixCache::Mode::STORE && prefix_pass_enabled && block_id == 0 && keep_prefixes() &&
+                layout.prefix_length >= target_length) {
                 auto prefix_cache = cache;
                 prefix_cache.mode = QwenImage21PrefixCache::Mode::PREFIX;
                 const int64_t t0  = ggml_time_ms();
