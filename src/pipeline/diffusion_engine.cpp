@@ -225,6 +225,9 @@ void StableDiffusionGGML::end_runners() {
 
 void StableDiffusionGGML::clear_generation_caches() {
     conditioning_cache_->clear();
+    if (cond_stage_model) {
+        cond_stage_model->clear_caches();
+    }
     reference_latents_.clear();
     for (const auto& runner : {diffusion_model, high_noise_diffusion_model}) {
         if (runner) {

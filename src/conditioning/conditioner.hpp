@@ -3,6 +3,7 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstring>
 #include <iomanip>
 #include <limits>
 #include <optional>
@@ -157,6 +158,8 @@ public:
     virtual void set_scale_overrides(float linear_scale, float attn_scale) {}
     virtual void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) {}
     virtual void runner_end() {}
+    // Drops what the conditioner keeps between requests (the weights or their adapters change).
+    virtual void clear_caches() {}
 };
 
 // ldm.modules.encoders.modules.FrozenCLIPEmbedder
@@ -1955,6 +1958,44 @@ struct LLMEmbedder : public Conditioner {
     std::shared_ptr<LLM::LLMRunner> llm;
     std::shared_ptr<T5Runner> byt5;
 
+    // Qwen Image 2.1's vision tower runs one graph per picture, so a picture's outputs depend on its pixels alone:
+    // kept while the latest request with pictures used them (an artist's own pictures come back in every view).
+    struct VisionOutputs {
+        sd::Tensor<float> image;
+        std::vector<sd::Tensor<float>> outputs;
+        bool used = false;
+    };
+    std::vector<VisionOutputs> vision_outputs_;
+
+    std::vector<sd::Tensor<float>> encode_vision_outputs(int n_threads, const sd::Tensor<float>& rgb) {
+        for (auto& entry : vision_outputs_) {
+            if (entry.image.shape() == rgb.shape() &&
+                std::memcmp(entry.image.data(), rgb.data(), static_cast<size_t>(rgb.numel()) * sizeof(float)) == 0) {
+                entry.used = true;
+                LOG_VERBOSE("vision outputs of picture %" PRId64 "x%" PRId64 " from an earlier request", rgb.shape()[0], rgb.shape()[1]);
+                return entry.outputs;
+            }
+        }
+        auto outputs = llm->encode_image_outputs(n_threads, rgb, false);
+        if (!outputs.empty()) {
+            vision_outputs_.push_back({rgb, outputs, true});
+        }
+        return outputs;
+    }
+
+    void end_vision_outputs() {
+        vision_outputs_.erase(std::remove_if(vision_outputs_.begin(), vision_outputs_.end(),
+                                             [](const VisionOutputs& entry) { return !entry.used; }),
+                              vision_outputs_.end());
+        for (auto& entry : vision_outputs_) {
+            entry.used = false;
+        }
+    }
+
+    void clear_caches() override {
+        vision_outputs_.clear();
+    }
+
     LLMEmbedder(ggml_backend_t backend,
                 const String2TensorStorage& tensor_storage_map      = {},
                 SDVersion version                                   = VERSION_QWEN_IMAGE,
@@ -2597,8 +2638,9 @@ struct LLMEmbedder : public Conditioner {
                             rgb[p + c * pixels] = 2.f * (image[p + c * pixels] * alpha + 1.f - alpha) - 1.f;
                         }
                     }
-                    auto outputs = llm->encode_image_outputs(n_threads, rgb, false);
+                    auto outputs = encode_vision_outputs(n_threads, rgb);
                     if (outputs.empty()) {
+                        end_vision_outputs();
                         return {};
                     }
                     prompt += (i == 0 ? "" : " ") + std::string("<image") + std::to_string(i + 1) + "><|vision_start|>";
@@ -2622,6 +2664,9 @@ struct LLMEmbedder : public Conditioner {
                         prompt += "<|image_pad|>";
                     }
                     prompt += "<|vision_end|>";
+                }
+                if (!conditioner_params.ref_images->empty()) {
+                    end_vision_outputs();
                 }
             }
             prompt_attn_range.first = static_cast<int>(prompt.size());
