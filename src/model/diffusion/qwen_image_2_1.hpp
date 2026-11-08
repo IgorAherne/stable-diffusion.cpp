@@ -335,14 +335,15 @@ namespace Qwen {
             const bool k_f16 = cache.mode == QwenImage21PrefixCache::Mode::REUSE && rope.fused &&
                                (ctx->flash_attn_enabled || ctx->sage_attn_enabled) && !(ctx->attn_scale > 0.f);
             k = norm_rope(ctx, k_proj, "norm_k", rope, k_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32);
+            ggml_tensor* k_copy = nullptr;
+            ggml_tensor* v_copy = nullptr;
             if (cache.mode == QwenImage21PrefixCache::Mode::STORE || cache.mode == QwenImage21PrefixCache::Mode::PREFIX) {
                 // Preserve query-first attention evaluation while writing each layer's
                 // prefix before its full-sequence K/V can accumulate across layers.
                 if (!cache.kv_only) {
                     ctx->expand_graph(q);
                 }
-                ggml_tensor* k_copy = nullptr;
-                auto persist        = [&](ggml_tensor* tensor, int axis, const char* name) {
+                auto persist = [&](ggml_tensor* tensor, int axis, const char* name) {
                     auto part = ggml_ext_slice(ctx->ggml_ctx, tensor, axis, 0, cache.prefix_length);
                     // Pack the contiguous data into wider rows so quantization blocks
                     // can exceed head_dim without padding or changing element order.
@@ -355,10 +356,7 @@ namespace Qwen {
                     return copy;
                 };
                 k_copy = persist(k, 1, "k");
-                persist(v, 2, "v");
-                if (cache.kv_only) {
-                    return ggml_cast(ctx->ggml_ctx, ggml_view_1d(ctx->ggml_ctx, k_copy, 1, 0), GGML_TYPE_F32);
-                }
+                v_copy = persist(v, 2, "v");
             }
             auto attend = [&](ggml_tensor* aq, ggml_tensor* ak, ggml_tensor* av, ggml_tensor* mask, bool* used = nullptr) {
                 bool used_flash_attn = false;
@@ -375,6 +373,22 @@ namespace Qwen {
                 }
                 return out;
             };
+            if (cache.kv_only) {
+                // The pass's output (nothing reads it): the attention a REUSE step makes - F32 queries against the
+                // cached F16 K and V - for a few queries. The step after the pass then finds that attention's kernels
+                // loaded (CUDA loads a kernel, and reserves its local memory, at its first launch), which a STORE
+                // step's drawn picture used to do; at their first launch inside that step's graph, with the card
+                // filled to its budget, they ran out of memory (a 12 GB card, five example pictures).
+                ggml_tensor* out = k_copy;
+                if (cache.type == GGML_TYPE_F16 && (ctx->flash_attn_enabled || ctx->sage_attn_enabled) &&
+                    !(ctx->attn_scale > 0.f)) {
+                    auto sq = ggml_ext_slice(ctx->ggml_ctx, k, 1, 0, std::min<int64_t>(64, cache.prefix_length));
+                    auto sk = ggml_reshape_4d(ctx->ggml_ctx, k_copy, dim_head, cache.prefix_length, heads, k->ne[3]);
+                    auto sv = ggml_reshape_4d(ctx->ggml_ctx, v_copy, dim_head, heads, cache.prefix_length, v->ne[3]);
+                    out     = attend(sq, sk, sv, nullptr);
+                }
+                return ggml_cast(ctx->ggml_ctx, ggml_view_1d(ctx->ggml_ctx, out, 1, 0), GGML_TYPE_F32);
+            }
             ggml_tensor* result = nullptr;
             if (cache.mode == QwenImage21PrefixCache::Mode::REUSE) {
                 auto prefix_k_cache = ctx->load_cache_tensor(cache.name + ".k");
