@@ -140,10 +140,13 @@ namespace Qwen {
     };
 
     struct QwenImage21PrefixCache {
+        // PREFIX: the prefix tokens alone, filling the cache as STORE does (their K/V never depend on the picture
+        // being drawn); the step itself then runs as a REUSE step.
         enum class Mode {
             NONE,
             STORE,
-            REUSE
+            REUSE,
+            PREFIX
         };
         Mode mode = Mode::NONE;
         std::string name;
@@ -155,6 +158,8 @@ namespace Qwen {
         // give it to the attention, so a step that reuses a kept prefix computes what these do (see
         // QwenImage21Runner::PrefixKeep).
         bool f16_target_keys = false;
+        // PREFIX, the last layer: only its K/V, the attention returns a one-value stand-in for the graph's output.
+        bool kv_only = false;
     };
 
     // Rope::apply_rope's permute of the table (pe [2, 2, d_head/2, L] -> [2, d_head/2, L, 2]), done once per graph and
@@ -330,11 +335,14 @@ namespace Qwen {
             const bool k_f16 = cache.mode == QwenImage21PrefixCache::Mode::REUSE && rope.fused &&
                                (ctx->flash_attn_enabled || ctx->sage_attn_enabled) && !(ctx->attn_scale > 0.f);
             k = norm_rope(ctx, k_proj, "norm_k", rope, k_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32);
-            if (cache.mode == QwenImage21PrefixCache::Mode::STORE) {
+            if (cache.mode == QwenImage21PrefixCache::Mode::STORE || cache.mode == QwenImage21PrefixCache::Mode::PREFIX) {
                 // Preserve query-first attention evaluation while writing each layer's
                 // prefix before its full-sequence K/V can accumulate across layers.
-                ctx->expand_graph(q);
-                auto persist = [&](ggml_tensor* tensor, int axis, const char* name) {
+                if (!cache.kv_only) {
+                    ctx->expand_graph(q);
+                }
+                ggml_tensor* k_copy = nullptr;
+                auto persist        = [&](ggml_tensor* tensor, int axis, const char* name) {
                     auto part = ggml_ext_slice(ctx->ggml_ctx, tensor, axis, 0, cache.prefix_length);
                     // Pack the contiguous data into wider rows so quantization blocks
                     // can exceed head_dim without padding or changing element order.
@@ -344,9 +352,13 @@ namespace Qwen {
                     // retain or recompute the full-sequence K/V in the final segment.
                     sd::ggml_graph_cut::mark_graph_cut(copy, cache.cut_group, name);
                     ctx->persist_cache_tensor(cache.name + "." + name, copy);
+                    return copy;
                 };
-                persist(k, 1, "k");
+                k_copy = persist(k, 1, "k");
                 persist(v, 2, "v");
+                if (cache.kv_only) {
+                    return ggml_cast(ctx->ggml_ctx, ggml_view_1d(ctx->ggml_ctx, k_copy, 1, 0), GGML_TYPE_F32);
+                }
             }
             auto attend = [&](ggml_tensor* aq, ggml_tensor* ak, ggml_tensor* av, ggml_tensor* mask, bool* used = nullptr) {
                 bool used_flash_attn = false;
@@ -427,11 +439,15 @@ namespace Qwen {
                                      !(ctx->attn_scale > 0.f) && sk->type == GGML_TYPE_F32;
                     return f16 ? ggml_cast(ctx->ggml_ctx, sk, GGML_TYPE_F16) : sk;
                 };
-                for (size_t i = 0; i < segments.size(); ++i) {
+                // (PREFIX: the picture being drawn, the last segment, is not in the sequence)
+                const size_t segment_count = segments.size() - (cache.mode == QwenImage21PrefixCache::Mode::PREFIX ? 1 : 0);
+                for (size_t i = 0; i < segment_count; ++i) {
                     const auto& segment = segments[i];
                     auto sq             = ggml_ext_slice(ctx->ggml_ctx, q, 1, segment.start, segment.end);
-                    auto sk             = keys(ggml_ext_slice(ctx->ggml_ctx, k, 1, 0, segment.end), i);
-                    auto sv             = ggml_ext_slice(ctx->ggml_ctx, v, 2, 0, segment.end);
+                    // K and V as views: the attention copies (K) or reads through its strides (V) what it needs, so
+                    // a contiguous copy here would only be one more pass over [0, end) per segment. Same values.
+                    auto sk = keys(ggml_ext_slice(ctx->ggml_ctx, k, 1, 0, segment.end, false), i);
+                    auto sv = ggml_ext_slice(ctx->ggml_ctx, v, 2, 0, segment.end, false);
                     auto out            = attend(sq, sk, sv, masks[i]);
                     result              = result == nullptr ? out : ggml_concat(ctx->ggml_ctx, result, out, 1);
                 }
@@ -491,6 +507,9 @@ namespace Qwen {
                 return ggml_mul(ctx, x, rows.target);
             }
             GGML_ASSERT(rows.prefix != nullptr);
+            if (prefix_length == x->ne[1]) {
+                return ggml_mul(ctx, x, rows.prefix);  // all tokens are the prefix (PREFIX)
+            }
             // Views, not copies: ggml_mul reads the strided parts and writes new contiguous tensors.
             auto target = ggml_mul(ctx, ggml_ext_slice(ctx, x, 1, prefix_length, x->ne[1], false), rows.target);
             auto prefix = ggml_mul(ctx, ggml_ext_slice(ctx, x, 1, 0, prefix_length, false), rows.prefix);
@@ -508,7 +527,10 @@ namespace Qwen {
             auto h                      = std::dynamic_pointer_cast<LayerNorm>(blocks["img_norm1"])->forward(ctx, x);
             h                           = modulate(ctx->ggml_ctx, h, modulation[0], prefix_length);
             h                           = std::dynamic_pointer_cast<QwenImage21Attention>(blocks["attn"])->forward(ctx, h, rope, layout.segments, masks, cache, attn_out_scale_folded);
-            x                           = ggml_add(ctx->ggml_ctx, x, modulate(ctx->ggml_ctx, h, modulation[1], prefix_length));
+            if (cache.kv_only) {
+                return h;
+            }
+            x = ggml_add(ctx->ggml_ctx, x, modulate(ctx->ggml_ctx, h, modulation[1], prefix_length));
             h                           = std::dynamic_pointer_cast<LayerNorm>(blocks["img_norm2"])->forward(ctx, x);
             h                           = modulate(ctx->ggml_ctx, h, modulation[2], prefix_length);
             auto fused                  = blocks.find("img_mlp.gate_up");
@@ -612,6 +634,9 @@ namespace Qwen {
             } else {
                 auto text = std::dynamic_pointer_cast<QwenImage21TextProjection>(blocks["txt_in"])->forward(ctx, context);
                 for (const auto& segment : layout.segments) {
+                    if (cache.mode == QwenImage21PrefixCache::Mode::PREFIX && segment.image_index == static_cast<int>(refs.size())) {
+                        continue;
+                    }
                     ggml_tensor* h;
                     if (segment.image_index < 0) {
                         h = ggml_ext_slice(ctx->ggml_ctx, text, 1, segment.context_start,
@@ -634,8 +659,12 @@ namespace Qwen {
                 auto layer_cache        = cache;
                 layer_cache.name        = cache.name + "." + std::to_string(i);
                 layer_cache.cut_group   = "qwen_image_2_1." + layer;
+                layer_cache.kv_only     = cache.mode == QwenImage21PrefixCache::Mode::PREFIX && i + 1 == config.num_layers;
                 auto block              = std::dynamic_pointer_cast<QwenImage21TransformerBlock>(blocks[layer]);
                 joint                   = block->forward(ctx, joint, step.mod_rows, step.rope, layout, masks, layer_cache, step.attn_out_scale_folded);
+                if (layer_cache.kv_only) {
+                    return joint;
+                }
                 sd::ggml_graph_cut::mark_graph_cut(joint, layer_cache.cut_group, "joint");
             }
             return joint;
@@ -660,6 +689,15 @@ namespace Qwen {
                 joint = ggml_ext_slice(ctx->ggml_ctx, joint, 1, layout.prefix_length, joint->ne[1]);
             }
             return head(ctx, joint, step.time, x);
+        }
+
+        // The prefix-only pass (PREFIX): every layer's K/V of the prefix tokens into the cache. Returns a one-value
+        // stand-in (the graph needs an output; nothing reads it).
+        ggml_tensor* forward_prefix(GGMLRunnerContext* ctx, ggml_tensor* timestep, ggml_tensor* context, const std::vector<ggml_tensor*>& refs, ggml_tensor* pe, const QwenImage21Layout& layout, const std::vector<ggml_tensor*>& masks, const QwenImage21PrefixCache& cache) {
+            GGML_ASSERT(cache.mode == QwenImage21PrefixCache::Mode::PREFIX);
+            auto step  = step_inputs(ctx, timestep, pe, layout, cache);
+            auto joint = embed(ctx, nullptr, context, refs, layout, cache);
+            return run_blocks(ctx, joint, step, layout, masks, cache, 0, config.num_layers);
         }
 
         int num_layers() const { return config.num_layers; }
@@ -740,6 +778,14 @@ namespace Qwen {
             return prefix_cache_keep == PrefixKeep::ON ||
                    (prefix_cache_keep == PrefixKeep::AUTO && flash_attn_enabled && !sage_attn_enabled);
         }
+
+        // The first step of a run whose prefix is not cached yet: a prefix-only pass (PREFIX) and then the step as a
+        // REUSE step, instead of one STORE step over the whole sequence. Where a kept prefix gives a picture bit for
+        // bit (keep_prefixes), the two give the same picture: the prefix rows' K/V are the same values computed
+        // without the drawn picture's rows, which they never attend to. The pass is ~40 % smaller than a STORE graph
+        // (no drawn picture's rows), so it is cut into fewer layer segments where memory is short, and the step after
+        // it fits whole as every later step does. SD_QWEN_PREFIX_PASS=0 (read per sampling run) keeps the STORE step.
+        bool prefix_pass_enabled = true;
 
         // The prefixes whose K/V the cache holds, with copies of everything those were computed from (when kept):
         // matched by content, as the tensors behind the engine's prefix ids are new for every request. The K/V do not
@@ -1222,6 +1268,8 @@ namespace Qwen {
                 // as its keys, the prefix ids, start again). This run's setting: the product form's (the environment
                 // variable, read now, else the model arg) with its schedule for this run's step count, else the research
                 // setting.
+                const char* prefix_pass_env = std::getenv("SD_QWEN_PREFIX_PASS");
+                prefix_pass_enabled         = !(prefix_pass_env != nullptr && std::strcmp(prefix_pass_env, "0") == 0);
                 block_cache_states.clear();
                 block_cache_disabled           = false;
                 block_cache_unavailable_logged = false;
@@ -1297,11 +1345,13 @@ namespace Qwen {
                     checked_cache.flash_attn_used = &flash_attn_used;
                 }
                 const bool cached         = active_cache.mode == QwenImage21PrefixCache::Mode::REUSE;
+                const bool prefix_only    = active_cache.mode == QwenImage21PrefixCache::Mode::PREFIX;
                 const auto first_position = layout.positions.begin() + (cached ? layout.prefix_length : 0);
+                const auto end_position   = prefix_only ? layout.positions.begin() + layout.prefix_length : layout.positions.end();
                 const size_t offset       = cached ? static_cast<size_t>(layout.prefix_length) : 0;
                 std::vector<Rope::SpatialRegion> regions;
                 for (auto region : layout.rope_layout.images) {
-                    if (region.begin >= offset) {
+                    if (region.begin >= offset && (!prefix_only || region.begin + region.count <= static_cast<size_t>(layout.prefix_length))) {
                         region.begin -= offset;
                         regions.push_back(region);
                     }
@@ -1312,12 +1362,12 @@ namespace Qwen {
                 // idle) instead of once per forward. Same values: the same computation on the same inputs.
                 // (a double holds every float, size and flag here exactly)
                 std::vector<double> key = {static_cast<double>(circular_x_enabled), static_cast<double>(circular_y_enabled),
-                                           static_cast<double>(regions.size()), static_cast<double>(layout.positions.end() - first_position)};
+                                           static_cast<double>(regions.size()), static_cast<double>(end_position - first_position)};
                 for (const auto& region : regions) {
                     key.insert(key.end(), {static_cast<double>(region.begin), static_cast<double>(region.count), region.height_period,
                                            region.width_period, static_cast<double>(region.height_axis), static_cast<double>(region.width_axis)});
                 }
-                for (auto it = first_position; it != layout.positions.end(); ++it) {
+                for (auto it = first_position; it != end_position; ++it) {
                     key.push_back(static_cast<double>(it->size()));
                     key.insert(key.end(), it->begin(), it->end());
                 }
@@ -1338,7 +1388,7 @@ namespace Qwen {
                     }
                     table->key.clear();
                     Rope::Embedding embedding;
-                    embedding.ids.assign(first_position, layout.positions.end());
+                    embedding.ids.assign(first_position, end_position);
                     embedding.positions.token_count = embedding.ids.size();
                     embedding.positions.images      = regions;
                     embedding.values                = Rope::embed_nd(embedding.ids, 1, 10000.f, config.axes_dim, embedding.layout, &embedding.frequencies);
@@ -1363,8 +1413,7 @@ namespace Qwen {
                 }
                 auto build = [&]() {
                     auto graph = new_graph_custom(QWEN_IMAGE_GRAPH_SIZE * 2);
-                    auto pe    = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 2, 2, config.head_dim / 2,
-                                                                layout.positions.size() - (cached ? layout.prefix_length : 0));
+                    auto pe    = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 2, 2, config.head_dim / 2, end_position - first_position);
                     set_backend_tensor_data(pe, pe_data.data());
                     std::vector<ggml_tensor*> masks, ref_inputs;
                     for (const auto& mask : mask_data) {
@@ -1383,6 +1432,10 @@ namespace Qwen {
                     ggml_tensor* out = nullptr;
                     switch (stage) {
                         case BlockCacheGraph::NONE:
+                            if (prefix_only) {
+                                out = model.forward_prefix(&ctx, make_input(*inputs.timesteps), make_input(context), ref_inputs, pe, layout, masks, checked_cache);
+                                break;
+                            }
                             out = model.forward(&ctx, make_input(x), make_input(*inputs.timesteps), cached ? nullptr : make_input(context),
                                                 ref_inputs, pe, layout, masks, checked_cache);
                             break;
@@ -1554,6 +1607,26 @@ namespace Qwen {
             auto run_step = [&](const QwenImage21PrefixCache& active_cache) {
                 return block_id != 0 ? run_block_cached(active_cache) : run(active_cache, BlockCacheGraph::NONE);
             };
+            if (cache.mode == QwenImage21PrefixCache::Mode::STORE && prefix_pass_enabled && block_id == 0 && keep_prefixes()) {
+                auto prefix_cache = cache;
+                prefix_cache.mode = QwenImage21PrefixCache::Mode::PREFIX;
+                const int64_t t0  = ggml_time_ms();
+                auto filled       = run(prefix_cache, BlockCacheGraph::NONE);
+                if (!filled.empty() && has_prefix_cache(cache)) {
+                    LOG_VERBOSE("Qwen Image 2.1: cached prefix %s (%" PRId64 " tokens, %s) in a prefix-only pass, %.2fs",
+                                cache.name.c_str(), layout.prefix_length, ggml_type_name(cache.type), (ggml_time_ms() - t0) / 1000.0);
+                    // (as after a STORE step: the pass's compute buffer would count against the steps that follow)
+                    workspace_.release();
+                    sync_runtime_residency();
+                    cache.mode = QwenImage21PrefixCache::Mode::REUSE;
+                } else if (!filled.empty()) {
+                    // (an incomplete cache: the STORE step below computes it again)
+                    free_cache_ctx_and_buffer();
+                    LOG_WARN("Qwen Image 2.1: the prefix-only pass left an incomplete prefix cache; computing the first step whole");
+                }
+                // A failed pass (memory, an attention that cannot take the F16 cache) leaves the STORE step below and
+                // its own fallbacks.
+            }
             auto result = run_step(cache);
             if (result.empty() && !flash_attn_used) {
                 // Casting an F16 cache back to F32 cannot recover its original values.

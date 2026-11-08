@@ -860,6 +860,7 @@ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
         // }
         v = ggml_ext_cont(ctx, ggml_permute(ctx, v, 1, 2, 0, 3));  // [N, n_kv_head, d_head, L_k]
         v = ggml_reshape_3d(ctx, v, L_k, d_head, n_kv_head * N);   // [N * n_kv_head, d_head, L_k]
+        k = ggml_ext_cont(ctx, k);                                 // (a caller's view of a longer K)
 
         auto kq = ggml_mul_mat(ctx, k, q);  // [N * n_head, L_q, L_k]
         ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
