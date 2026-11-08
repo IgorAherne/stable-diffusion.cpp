@@ -798,12 +798,14 @@ namespace Qwen {
         // bit (keep_prefixes), the two give the same picture: the prefix rows' K/V are the same values computed
         // without the drawn picture's rows, which they never attend to. The pass is ~40 % smaller than a STORE graph
         // (no drawn picture's rows), so it is cut into fewer layer segments where memory is short, and the step after
-        // it fits whole as every later step does. SD_QWEN_PREFIX_PASS=0 (read per sampling run) keeps the STORE step.
-        // Only for a prefix at least as long as the drawn picture: the products then take at least as many rows as a
-        // REUSE step's do, whose rows the kept prefix already relies on matching a STORE step's. Fewer rows can take
-        // other kernels (the W8A8 int8 products start at 1,024; a text-only prompt's ~60 rows went through the k-quant
-        // ones and changed the picture).
-        bool prefix_pass_enabled = true;
+        // it fits whole as every later step does. Only for a prefix at least as long as the drawn picture: the products
+        // then take at least as many rows as a REUSE step's do, whose rows the kept prefix already relies on matching a
+        // STORE step's. Fewer rows can take other kernels (the W8A8 int8 products start at 1,024; a text-only prompt's
+        // ~60 rows went through the k-quant ones and changed the picture).
+        // Off unless SD_QWEN_PREFIX_PASS=1 (read per sampling run): on a 12 GB RTX 3060 it saved 0.7 s of a
+        // SuperTexture view's first step, but with five example pictures the VAE encodes and the albedo decode that
+        // follow ran ~2x slower (the card's memory left in another state; not understood yet), a net loss.
+        bool prefix_pass_enabled = false;
 
         // The prefixes whose K/V the cache holds, with copies of everything those were computed from (when kept):
         // matched by content, as the tensors behind the engine's prefix ids are new for every request. The K/V do not
@@ -1287,7 +1289,7 @@ namespace Qwen {
                 // variable, read now, else the model arg) with its schedule for this run's step count, else the research
                 // setting.
                 const char* prefix_pass_env = std::getenv("SD_QWEN_PREFIX_PASS");
-                prefix_pass_enabled         = !(prefix_pass_env != nullptr && std::strcmp(prefix_pass_env, "0") == 0);
+                prefix_pass_enabled         = prefix_pass_env != nullptr && std::strcmp(prefix_pass_env, "1") == 0;
                 block_cache_states.clear();
                 block_cache_disabled           = false;
                 block_cache_unavailable_logged = false;
