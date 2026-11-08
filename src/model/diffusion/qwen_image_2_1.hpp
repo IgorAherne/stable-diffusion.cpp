@@ -162,6 +162,54 @@ namespace Qwen {
         bool kv_only = false;
     };
 
+    // Whether the prefix-only pass (PREFIX) can end in its stand-in output, a REUSE step's attention over the cached K
+    // and V (see QwenImage21Attention::forward): an F16 cache, flash or sage attention, no attention scale override.
+    // The pass runs only then; any other cache is filled by the ordinary STORE step.
+    __STATIC_INLINE__ bool qwen_image_2_1_prefix_pass_attends(ggml_type cache_type, bool flash_attn, bool sage_attn, float attn_scale) {
+        return cache_type == GGML_TYPE_F16 && (flash_attn || sage_attn) && !(attn_scale > 0.f);
+    }
+
+    // Whether ggml-cuda's W8A8 int8 path takes a transformer block's matrix product of this many rows, as far as its
+    // environment variables say (w8a8-mm.cu reads the same ones): GGML_CUDA_W8A8_KERNEL=off or the research emulation
+    // (GGML_CUDA_W8A8) keep it off, GGML_CUDA_W8A8_MIN_TOKENS (1,024 by default) is the fewest rows, and a weight-name
+    // filter other than the default counts as off (it could leave some block weights out).
+    __STATIC_INLINE__ bool qwen_image_2_1_w8a8_env_takes_rows(int64_t rows) {
+#ifndef SD_USE_UPSTREAM_GGML
+        const char* kernel = std::getenv("GGML_CUDA_W8A8_KERNEL");
+        if (kernel != nullptr && (std::strcmp(kernel, "off") == 0 || std::strcmp(kernel, "0") == 0)) {
+            return false;
+        }
+        const char* emulation = std::getenv("GGML_CUDA_W8A8");
+        if (emulation != nullptr && std::strcmp(emulation, "off") != 0) {
+            return false;
+        }
+        const char* names = std::getenv("GGML_CUDA_W8A8_NAMES");
+        if (names != nullptr && names[0] != '\0' && std::strcmp(names, "*") != 0 && std::strcmp(names, "transformer_blocks") != 0) {
+            return false;
+        }
+        const char* min_tokens = std::getenv("GGML_CUDA_W8A8_MIN_TOKENS");
+        return rows >= (min_tokens != nullptr ? std::atoll(min_tokens) : 1024);
+#else
+        (void)rows;
+        return false;
+#endif
+    }
+
+    // The weight types ggml-cuda's W8A8 path converts (its w8a8_weight_type).
+    __STATIC_INLINE__ bool qwen_image_2_1_w8a8_weight_type(ggml_type type) {
+        switch (type) {
+            case GGML_TYPE_Q2_K:
+            case GGML_TYPE_Q3_K:
+            case GGML_TYPE_Q4_K:
+            case GGML_TYPE_Q5_K:
+            case GGML_TYPE_Q6_K:
+            case GGML_TYPE_Q8_0:
+                return true;
+            default:
+                return false;
+        }
+    }
+
     // Rope::apply_rope's permute of the table (pe [2, 2, d_head/2, L] -> [2, d_head/2, L, 2]), done once per graph and
     // shared by every layer's q and k instead of once per apply_rope call.
     __STATIC_INLINE__ ggml_tensor* qwen_image_2_1_rope_table(ggml_context* ctx, ggml_tensor* pe) {
@@ -378,10 +426,11 @@ namespace Qwen {
                 // cached F16 K and V - for a few queries. The step after the pass then finds that attention's kernels
                 // loaded (CUDA loads a kernel, and reserves its local memory, at its first launch), which a STORE
                 // step's drawn picture used to do; at their first launch inside that step's graph, with the card
-                // filled to its budget, they ran out of memory (a 12 GB card, five example pictures).
-                ggml_tensor* out = k_copy;
-                if (cache.type == GGML_TYPE_F16 && (ctx->flash_attn_enabled || ctx->sage_attn_enabled) &&
-                    !(ctx->attn_scale > 0.f)) {
+                // filled to its budget, they ran out of memory (a 12 GB card, five example pictures). The pass runs
+                // only where that attention is built (qwen_image_2_1_prefix_pass_attends); otherwise a one-value view
+                // of the F32 RoPE output, never of the cache's copy (a block-quantized type has no one-value view).
+                ggml_tensor* out = k;
+                if (qwen_image_2_1_prefix_pass_attends(cache.type, ctx->flash_attn_enabled, ctx->sage_attn_enabled, ctx->attn_scale)) {
                     auto sq = ggml_ext_slice(ctx->ggml_ctx, k, 1, 0, std::min<int64_t>(64, cache.prefix_length));
                     auto sk = ggml_reshape_4d(ctx->ggml_ctx, k_copy, dim_head, cache.prefix_length, heads, k->ne[3]);
                     auto sv = ggml_reshape_4d(ctx->ggml_ctx, v_copy, dim_head, heads, cache.prefix_length, v->ne[3]);
@@ -458,8 +507,10 @@ namespace Qwen {
                 for (size_t i = 0; i < segment_count; ++i) {
                     const auto& segment = segments[i];
                     auto sq             = ggml_ext_slice(ctx->ggml_ctx, q, 1, segment.start, segment.end);
-                    // K and V as views: the attention copies (K) or reads through its strides (V) what it needs, so
-                    // a contiguous copy here would only be one more pass over [0, end) per segment. Same values.
+                    // K and V as views: the attention makes what it needs from them (K: flash attention's F16 cast,
+                    // SageAttention's contiguous copy, or the F16 cast in keys; V: flash attention on CUDA reads the
+                    // F32 view through its strides, SageAttention makes a permuted copy and then its F16 cast), so a
+                    // contiguous copy here was one more pass over [0, end) per segment. Same values.
                     auto sk = keys(ggml_ext_slice(ctx->ggml_ctx, k, 1, 0, segment.end, false), i);
                     auto sv = ggml_ext_slice(ctx->ggml_ctx, v, 2, 0, segment.end, false);
                     auto out            = attend(sq, sk, sv, masks[i]);
@@ -780,6 +831,9 @@ namespace Qwen {
         // ON: kept everywhere; under SageAttention the STORE step then gives the drawn picture's attention the keys in
         // F16 as well (f16_target_keys), so a picture is what its seed gives with or without a kept prefix (measured
         // bit for bit), and differs from AUTO's by that rounding (53-55 dB PSNR with the example picture).
+        // (Bit for bit where the blocks' products compute a row alike at the REUSE step's row count, the drawn
+        // picture's, and the STORE step's, the whole sequence's: ggml-cuda's W8A8 path from 1,024 rows on. A picture
+        // under 1,024 tokens whose sequence reaches 1,024, or a card without that path, can differ by rounding.)
         // OFF: never kept.
         enum class PrefixKeep {
             AUTO,
@@ -798,10 +852,13 @@ namespace Qwen {
         // bit (keep_prefixes), the two give the same picture: the prefix rows' K/V are the same values computed
         // without the drawn picture's rows, which they never attend to. The pass is ~40 % smaller than a STORE graph
         // (no drawn picture's rows), so it is cut into fewer layer segments where memory is short, and the step after
-        // it fits whole as every later step does. Only for a prefix at least as long as the drawn picture: the products
-        // then take at least as many rows as a REUSE step's do, whose rows the kept prefix already relies on matching a
-        // STORE step's. Fewer rows can take other kernels (the W8A8 int8 products start at 1,024; a text-only prompt's
-        // ~60 rows went through the k-quant ones and changed the picture).
+        // it fits whole as every later step does. The same values need the same kernels at each row count the blocks'
+        // products get: the pass's P prefix rows, the REUSE step's T drawn rows, a STORE step's P + T. ggml-cuda's
+        // W8A8 int8 path, from 1,024 rows, gave every row the same bits at all three (measured); below it the k-quant
+        // kernels take the products, and their split of the sums follows the row count (a text-only prompt's ~60
+        // prefix rows changed the picture). So only where W8A8 takes the drawn picture's rows
+        // (w8a8_takes_block_products) and the prefix is at least as long, the case measured, and with a cache the
+        // pass's stand-in attention takes (qwen_image_2_1_prefix_pass_attends).
         // Off unless SD_QWEN_PREFIX_PASS=1 (read per sampling run): on a 12 GB RTX 3060 it saved 0.7 s of a
         // SuperTexture view's first step, but with five example pictures the VAE encodes and the albedo decode that
         // follow ran ~2x slower (the card's memory left in another state; not understood yet), a net loss.
@@ -1148,6 +1205,27 @@ namespace Qwen {
 
         void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors, const std::string& prefix) override {
             model.get_param_tensors(tensors, prefix);
+        }
+
+        // Whether ggml-cuda's W8A8 int8 path takes every matrix product of the transformer blocks at this many rows: a
+        // CUDA backend, its environment variables (qwen_image_2_1_w8a8_env_takes_rows) and the weights' types, by the
+        // names and types its check reads. The card's own side (Pascal dp4a, Turing or sm_80+ code in the build) is the
+        // backend's and not visible here.
+        bool w8a8_takes_block_products(int64_t rows) const {
+            if (!sd_backend_is(runtime_backend, "CUDA") || params_ctx == nullptr || !qwen_image_2_1_w8a8_env_takes_rows(rows)) {
+                return false;
+            }
+            int matrices = 0;
+            for (ggml_tensor* t = ggml_get_first_tensor(params_ctx); t != nullptr; t = ggml_get_next_tensor(params_ctx, t)) {
+                if (ggml_n_dims(t) < 2 || std::strstr(ggml_get_name(t), "transformer_blocks.") == nullptr) {
+                    continue;
+                }
+                if (!qwen_image_2_1_w8a8_weight_type(t->type)) {
+                    return false;
+                }
+                ++matrices;
+            }
+            return matrices > 0;
         }
 
         bool has_prefix_cache(const QwenImage21PrefixCache& cache) {
@@ -1628,7 +1706,8 @@ namespace Qwen {
                 return block_id != 0 ? run_block_cached(active_cache) : run(active_cache, BlockCacheGraph::NONE);
             };
             if (cache.mode == QwenImage21PrefixCache::Mode::STORE && prefix_pass_enabled && block_id == 0 && keep_prefixes() &&
-                layout.prefix_length >= target_length) {
+                qwen_image_2_1_prefix_pass_attends(cache.type, flash_attn_enabled, sage_attn_enabled, attn_scale) &&
+                layout.prefix_length >= target_length && w8a8_takes_block_products(target_length)) {
                 auto prefix_cache = cache;
                 prefix_cache.mode = QwenImage21PrefixCache::Mode::PREFIX;
                 const int64_t t0  = ggml_time_ms();
