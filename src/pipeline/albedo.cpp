@@ -422,15 +422,17 @@ namespace sd::pipeline {
         // The Qwen Image 2.1 VAE reads RGBA: the picture goes in opaque.
         sd::Tensor<float> rgba({W, H, 4, 1});
         float* px = rgba.data();
-        for (int64_t y = 0; y < H; ++y) {
-            for (int64_t x = 0; x < W; ++x) {
-                const uint8_t* src = image.data + (y * W + x) * 3;
-                for (int c = 0; c < 3; ++c) {
-                    px[(c * H + y) * W + x] = src[c] / 255.f;
+        sd::parallel_for(0, H, 32, [&](int64_t row_begin, int64_t row_end) {
+            for (int64_t y = row_begin; y < row_end; ++y) {
+                for (int64_t x = 0; x < W; ++x) {
+                    const uint8_t* src = image.data + (y * W + x) * 3;
+                    for (int c = 0; c < 3; ++c) {
+                        px[(c * H + y) * W + x] = src[c] / 255.f;
+                    }
+                    px[(3 * H + y) * W + x] = 1.f;
                 }
-                px[(3 * H + y) * W + x] = 1.f;
             }
-        }
+        });
 
         AlbedoScope scope(sd);
         auto latent = encode(sd, rgba);
@@ -485,14 +487,16 @@ namespace sd::pipeline {
         }
         const float inverse_gamma = 1.f / params->output_gamma;
         const float* albedo       = decoded.data();
-        for (int64_t y = 0; y < H; ++y) {
-            for (int64_t x = 0; x < W; ++x) {
-                for (int c = 0; c < 3; ++c) {
-                    const float a               = std::min(1.f, std::max(0.f, albedo[(c * H + y) * W + x]));
-                    pixels[(y * W + x) * 3 + c] = static_cast<uint8_t>(std::pow(a, inverse_gamma) * 255.f + 0.5f);
+        sd::parallel_for(0, H, 32, [&](int64_t row_begin, int64_t row_end) {
+            for (int64_t y = row_begin; y < row_end; ++y) {
+                for (int64_t x = 0; x < W; ++x) {
+                    for (int c = 0; c < 3; ++c) {
+                        const float a               = std::min(1.f, std::max(0.f, albedo[(c * H + y) * W + x]));
+                        pixels[(y * W + x) * 3 + c] = static_cast<uint8_t>(std::pow(a, inverse_gamma) * 255.f + 0.5f);
+                    }
                 }
             }
-        }
+        });
         *result = {static_cast<uint32_t>(W), static_cast<uint32_t>(H), 3, pixels};
         LOG_INFO("albedo %" PRId64 "x%" PRId64 " in %.2fs (add-on files %.2fs, encode %.2fs, transformer %.2fs, decode %.2fs); add-on weights LoRA %.1f MB + decoder %.1f MB",
                  W, H, (t_decode - t0) / 1000.0, (t_load - t0) / 1000.0, (t_encode - t_load) / 1000.0,

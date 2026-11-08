@@ -203,6 +203,19 @@ namespace sd {
         return remaining / 2;
     }
 
+    static void log_transform(const std::string& label, const ImageTransform& p, const std::string& filter, ops::InterpolateMode mode, bool antialias) {
+        LOG_INFO("preprocess %s: %dx%d crop=(%d,%d,%d,%d) resize=%dx%d pad=(%d,%d) output=%dx%d filter=%s(%d) antialias=%s",
+                 label.c_str(), p.source_width, p.source_height, p.x, p.y, p.crop_width, p.crop_height,
+                 p.resize_width, p.resize_height, p.pad_x, p.pad_y, p.width, p.height, filter.c_str(), static_cast<int>(mode), BOOL_STR(antialias));
+    }
+
+    static bool is_identity(const ImageTransform& p) {
+        return p.x == 0 && p.y == 0 && p.pad_x == 0 && p.pad_y == 0 &&
+               p.crop_width == p.source_width && p.crop_height == p.source_height &&
+               p.resize_width == p.crop_width && p.resize_height == p.crop_height &&
+               p.width == p.resize_width && p.height == p.resize_height;
+    }
+
     Tensor<float> ImagePreprocessor::apply_transform(const Tensor<float>& image, const std::map<std::string, std::string>& options, ImageTransform p, const std::string& label, ops::InterpolateMode default_filter) const {
         auto value = [&](const char* key, const char* fallback) {
             auto it = options.find(key);
@@ -263,24 +276,14 @@ namespace sd {
                 }
             }
         }
-        LOG_INFO("preprocess %s: %dx%d crop=(%d,%d,%d,%d) resize=%dx%d pad=(%d,%d) output=%dx%d filter=%s(%d) antialias=%s",
-                 label.c_str(), p.source_width, p.source_height, p.x, p.y, p.crop_width, p.crop_height,
-                 p.resize_width, p.resize_height, p.pad_x, p.pad_y, p.width, p.height, filter.c_str(), static_cast<int>(mode), BOOL_STR(antialias));
+        log_transform(label, p, filter, mode, antialias);
         return output;
     }
 
-    Tensor<float> ImagePreprocessor::apply_geometry(const Tensor<float>& image, ImageTarget target, int index, int width, int height, ImageResizeMode default_mode, ops::InterpolateMode default_filter, ImageTransform* plan_out) const {
-        if (!valid_ || image.empty())
-            return {};
-        const std::string label = std::string(enum_name(target, image_targets)) + "[" + std::to_string(index) + "]";
-        auto options            = resolve_options(target, index);
-        if (image.dim() != 4 || image.shape()[3] != 1 || image.shape()[2] < 1 || image.shape()[2] > 4) {
-            fail(label + ": expected one image with 1 to 4 channels");
-            return {};
-        }
-        ImageTransform p;
-        p.source_width = p.crop_width = static_cast<int>(image.shape()[0]);
-        p.source_height = p.crop_height = static_cast<int>(image.shape()[1]);
+    bool ImagePreprocessor::plan_geometry(int source_width, int source_height, int channels, const std::map<std::string, std::string>& options, const std::string& label, int width, int height, ImageResizeMode default_mode, ImageTransform& p) const {
+        p              = {};
+        p.source_width = p.crop_width = source_width;
+        p.source_height = p.crop_height = source_height;
         int target_width                = width > 0 ? width : p.source_width;
         int target_height               = height > 0 ? height : p.source_height;
         if (options.count("width")) {
@@ -293,8 +296,7 @@ namespace sd {
         p.height = p.resize_height = target_height;
         if (mode == ImageResizeMode::None) {
             if (options.count("width") && (target_width != p.source_width || target_height != p.source_height)) {
-                fail(label + ": mode=none conflicts with requested dimensions");
-                return {};
+                return fail(label + ": mode=none conflicts with requested dimensions");
             }
             p.width = p.resize_width = p.source_width;
             p.height = p.resize_height = p.source_height;
@@ -308,8 +310,7 @@ namespace sd {
                 p.crop_height = std::max(1, static_cast<int>(int64_t(p.source_width) * target_height / target_width));
             }
             if (p.crop_width > p.source_width || p.crop_height > p.source_height) {
-                fail(label + ": crop exceeds source dimensions");
-                return {};
+                return fail(label + ": crop exceeds source dimensions");
             }
             p.x = anchor_offset(p.source_width - p.crop_width, anchor, true);
             p.y = anchor_offset(p.source_height - p.crop_height, anchor, false);
@@ -321,31 +322,54 @@ namespace sd {
             p.pad_y         = anchor_offset(target_height - p.resize_height, anchor, false);
         }
         if (p.width <= 0 || p.height <= 0) {
-            fail(label + ": invalid output dimensions");
+            return fail(label + ": invalid output dimensions");
+        }
+        uint64_t max_pixels = std::min<uint64_t>(INT64_MAX, SIZE_MAX / sizeof(float)) / static_cast<uint64_t>(channels);
+        if (uint64_t(p.width) * p.height > max_pixels || uint64_t(p.resize_width) * p.resize_height > max_pixels)
+            return fail(label + ": image allocation size overflows");
+        return true;
+    }
+
+    Tensor<float> ImagePreprocessor::apply_geometry(const Tensor<float>& image, ImageTarget target, int index, int width, int height, ImageResizeMode default_mode, ops::InterpolateMode default_filter, ImageTransform* plan_out) const {
+        if (!valid_ || image.empty())
+            return {};
+        const std::string label = std::string(enum_name(target, image_targets)) + "[" + std::to_string(index) + "]";
+        auto options            = resolve_options(target, index);
+        if (image.dim() != 4 || image.shape()[3] != 1 || image.shape()[2] < 1 || image.shape()[2] > 4) {
+            fail(label + ": expected one image with 1 to 4 channels");
             return {};
         }
-        uint64_t max_pixels = std::min<uint64_t>(INT64_MAX, SIZE_MAX / sizeof(float)) / static_cast<uint64_t>(image.shape()[2]);
-        if (uint64_t(p.width) * p.height > max_pixels || uint64_t(p.resize_width) * p.resize_height > max_pixels) {
-            fail(label + ": image allocation size overflows");
+        ImageTransform p;
+        if (!plan_geometry(static_cast<int>(image.shape()[0]), static_cast<int>(image.shape()[1]), static_cast<int>(image.shape()[2]),
+                           options, label, width, height, default_mode, p))
             return {};
-        }
         if (plan_out != nullptr)
             *plan_out = p;
         return apply_transform(image, options, p, label, default_filter);
     }
 
-    Tensor<float> ImagePreprocessor::preprocess_input(sd_image_t image, ImageTarget target, int index, int width, int height) {
+    Tensor<float> ImagePreprocessor::preprocess_input(sd_image_t image, ImageTarget target, int index, int width, int height, bool* unchanged) {
+        if (unchanged != nullptr)
+            *unchanged = false;
         if (image.data == nullptr || image.width == 0 || image.height == 0 || image.width > INT_MAX || image.height > INT_MAX || image.channel < 1 || image.channel > 4) {
             fail(std::string(enum_name(target, image_targets)) + ": invalid input image");
             return {};
         }
-        auto tensor = sd_image_to_tensor(image);
+        // Without options, an identity transform only round-trips the 8-bit values through x / 255 and back,
+        // which restores every value exactly; the caller can then keep its image as it is.
+        const bool may_skip = unchanged != nullptr && valid_ && resolve_options(target, index).empty();
         if (target == ImageTarget::Mask && has_init_transform_) {
             auto options = resolve_options(target, index);
             if (image.width != init_transform_.source_width || image.height != init_transform_.source_height) {
                 fail("mask and init source dimensions must match");
                 return {};
             }
+            if (may_skip && is_identity(init_transform_)) {
+                log_transform("mask[0]", init_transform_, "auto", ops::InterpolateMode::NearestExact, false);
+                *unchanged = true;
+                return {};
+            }
+            auto tensor            = sd_image_to_tensor(image);
             bool geometry_override = options.count("width") || options.count("anchor") ||
                                      (options.count("mode") && options.at("mode") != "auto");
             if (geometry_override) {
@@ -365,8 +389,26 @@ namespace sd {
             }
             return apply_transform(tensor, options, init_transform_, "mask[0]", ops::InterpolateMode::NearestExact);
         }
-        auto result = apply_geometry(tensor, target, index, width, height, width > 0 ? ImageResizeMode::CropResize : ImageResizeMode::None,
-                                     target == ImageTarget::Mask ? ops::InterpolateMode::NearestExact : ops::InterpolateMode::Nearest,
+        const ImageResizeMode default_mode       = width > 0 ? ImageResizeMode::CropResize : ImageResizeMode::None;
+        const ops::InterpolateMode default_filter = target == ImageTarget::Mask ? ops::InterpolateMode::NearestExact : ops::InterpolateMode::Nearest;
+        if (may_skip) {
+            const std::string label = std::string(enum_name(target, image_targets)) + "[" + std::to_string(index) + "]";
+            ImageTransform p;
+            if (!plan_geometry(static_cast<int>(image.width), static_cast<int>(image.height), static_cast<int>(image.channel), {},
+                               label, width, height, default_mode, p))
+                return {};
+            if (is_identity(p)) {
+                if (target == ImageTarget::Init) {
+                    init_transform_     = p;
+                    has_init_transform_ = true;
+                }
+                log_transform(label, p, "auto", default_filter, false);
+                *unchanged = true;
+                return {};
+            }
+        }
+        auto tensor = sd_image_to_tensor(image);
+        auto result = apply_geometry(tensor, target, index, width, height, default_mode, default_filter,
                                      target == ImageTarget::Init ? &init_transform_ : nullptr);
         if (target == ImageTarget::Init)
             has_init_transform_ = !result.empty();
@@ -381,9 +423,12 @@ namespace sd {
     bool ImagePreprocessor::prepare_image(sd_image_t& image, ImageTarget target, int index, int width, int height) {
         if (image.data == nullptr)
             return true;
-        auto options = resolve_options(target, index);
-        bool canny   = options.count("canny") && options.at("canny") == "true";
-        auto tensor  = preprocess_input(image, target, index, width, height);
+        auto options   = resolve_options(target, index);
+        bool canny     = options.count("canny") && options.at("canny") == "true";
+        bool unchanged = false;
+        auto tensor    = preprocess_input(image, target, index, width, height, &unchanged);
+        if (unchanged)
+            return true;
         if (tensor.empty())
             return false;
         auto output = tensor_to_sd_image(tensor);

@@ -2,6 +2,7 @@
 #define __SD_CORE_TENSOR_HPP__
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -301,12 +302,14 @@ namespace sd {
 
         template <typename... Indices, typename = std::enable_if_t<(std::is_convertible_v<Indices, int64_t> && ...)>>
         T& index(Indices... indices) {
-            return index(std::vector<int64_t>{static_cast<int64_t>(indices)...});
+            const std::array<int64_t, sizeof...(Indices)> coord = {static_cast<int64_t>(indices)...};
+            return data_.at(offset_of(coord.data(), coord.size()));
         }
 
         template <typename... Indices, typename = std::enable_if_t<(std::is_convertible_v<Indices, int64_t> && ...)>>
         const T& index(Indices... indices) const {
-            return index(std::vector<int64_t>{static_cast<int64_t>(indices)...});
+            const std::array<int64_t, sizeof...(Indices)> coord = {static_cast<int64_t>(indices)...};
+            return data_.at(offset_of(coord.data(), coord.size()));
         }
 
         T& operator[](int64_t index) {
@@ -319,9 +322,13 @@ namespace sd {
 
     private:
         size_t offset_of(const std::vector<int64_t>& coord) const {
-            if (coord.size() != shape_.size()) {
+            return offset_of(coord.data(), coord.size());
+        }
+
+        size_t offset_of(const int64_t* coord, size_t rank) const {
+            if (rank != shape_.size()) {
                 tensor_throw_invalid_argument("Tensor index rank mismatch: coord_rank=" +
-                                              std::to_string(coord.size()) + ", shape=" +
+                                              std::to_string(rank) + ", shape=" +
                                               tensor_shape_to_string(shape_));
             }
             size_t offset = 0;
@@ -1309,23 +1316,62 @@ namespace sd {
             }
 
             Tensor<T> output(std::move(output_shape));
+            const size_t rank = static_cast<size_t>(input.dim());
+            std::vector<int64_t> input_strides(rank, 1);
+            for (size_t i = 1; i < rank; ++i) {
+                input_strides[i] = input_strides[i - 1] * input.shape()[i - 1];
+            }
+            const int64_t row_length = output.shape()[0];
+            const int64_t rows       = output.numel() / row_length;
+            // fn(row, the row's coordinates on axes 1..rank-1) for every output row, rows spread over the workers.
+            auto for_rows = [&](int64_t grain, auto&& fn) {
+                parallel_for(0, rows, grain, [&](int64_t row_begin, int64_t row_end) {
+                    std::vector<int64_t> coord(rank, 0);
+                    int64_t rest = row_begin;
+                    for (size_t i = 1; i < rank; ++i) {
+                        coord[i] = rest % output.shape()[i];
+                        rest /= output.shape()[i];
+                    }
+                    for (int64_t row = row_begin; row < row_end; ++row) {
+                        fn(row, coord);
+                        for (size_t i = 1; i < rank; ++i) {
+                            if (++coord[i] < output.shape()[i]) {
+                                break;
+                            }
+                            coord[i] = 0;
+                        }
+                    }
+                });
+            };
+
             if (mode == InterpolateMode::Nearest ||
                 mode == InterpolateMode::NearestExact ||
                 !has_downsampling) {
-                for (int64_t flat = 0; flat < output.numel(); ++flat) {
-                    std::vector<int64_t> output_coord = tensor_unravel_index(flat, output.shape());
-                    std::vector<int64_t> input_coord(static_cast<size_t>(input.dim()), 0);
-                    for (size_t i = 0; i < static_cast<size_t>(input.dim()); ++i) {
-                        if (mode == InterpolateMode::NearestExact) {
-                            input_coord[i] = nearest_exact_interpolate_index(output_coord[i],
-                                                                             input.shape()[i],
-                                                                             output.shape()[i]);
-                        } else {
-                            input_coord[i] = output_coord[i] * input.shape()[i] / output.shape()[i];
-                        }
+                std::vector<std::vector<int64_t>> source_offsets(rank);
+                for (size_t i = 0; i < rank; ++i) {
+                    const int64_t input_dim  = input.shape()[i];
+                    const int64_t output_dim = output.shape()[i];
+                    source_offsets[i].resize(static_cast<size_t>(output_dim));
+                    for (int64_t o = 0; o < output_dim; ++o) {
+                        const int64_t source = mode == InterpolateMode::NearestExact
+                                                   ? nearest_exact_interpolate_index(o, input_dim, output_dim)
+                                                   : o * input_dim / output_dim;
+                        source_offsets[i][static_cast<size_t>(o)] = source * input_strides[i];
                     }
-                    output[flat] = input.index(input_coord);
                 }
+                const T* src = input.data();
+                T* dst       = output.data();
+                for_rows(16, [&](int64_t row, const std::vector<int64_t>& coord) {
+                    int64_t base = 0;
+                    for (size_t i = 1; i < rank; ++i) {
+                        base += source_offsets[i][static_cast<size_t>(coord[i])];
+                    }
+                    const int64_t* offsets = source_offsets[0].data();
+                    T* out                 = dst + row * row_length;
+                    for (int64_t x = 0; x < row_length; ++x) {
+                        out[x] = src[base + offsets[x]];
+                    }
+                });
 
                 return output;
             }
@@ -1374,49 +1420,61 @@ namespace sd {
                 }
             };
 
-            // Reduction modes only differ from nearest mode when downsampling.
-            for (int64_t flat_out = 0; flat_out < output.numel(); ++flat_out) {
-                std::vector<int64_t> output_coord = tensor_unravel_index(flat_out, output.shape());
-
-                std::vector<int64_t> input_start(output.dim(), 0);
-                std::vector<int64_t> input_end(output.dim(), 0);
-
-                for (size_t i = 0; i < static_cast<size_t>(output.dim()); ++i) {
-                    const int64_t input_dim  = input.shape()[i];
-                    const int64_t output_dim = output.shape()[i];
-
-                    input_start[i] = std::max(int64_t(0), static_cast<int64_t>(output_coord[i] * input_dim / output_dim));
-                    input_end[i]   = std::min(input_dim, ((output_coord[i] + 1) * input_dim + output_dim - 1) / output_dim);
+            // Reduction modes only differ from nearest mode when downsampling. A window is walked with its last
+            // axis fastest: the order NearestAvg's sums have always been taken in.
+            std::vector<std::vector<int64_t>> window_starts(rank);
+            std::vector<std::vector<int64_t>> window_ends(rank);
+            for (size_t i = 0; i < rank; ++i) {
+                const int64_t input_dim  = input.shape()[i];
+                const int64_t output_dim = output.shape()[i];
+                window_starts[i].resize(static_cast<size_t>(output_dim));
+                window_ends[i].resize(static_cast<size_t>(output_dim));
+                for (int64_t o = 0; o < output_dim; ++o) {
+                    window_starts[i][static_cast<size_t>(o)] = std::max(int64_t(0), static_cast<int64_t>(o * input_dim / output_dim));
+                    window_ends[i][static_cast<size_t>(o)]   = std::min(input_dim, ((o + 1) * input_dim + output_dim - 1) / output_dim);
                 }
-
-                T value                               = init_reduction();
-                bool done_window                      = false;
-                std::vector<int64_t> current_in_coord = input_start;
-
-                while (!done_window) {
-                    reduce_value(value, input.index(current_in_coord));
-
-                    for (int d = static_cast<int>(output.dim()) - 1; d >= 0; --d) {
-                        if (++current_in_coord[d] < input_end[d]) {
-                            break;
-                        }
-                        current_in_coord[d] = input_start[d];
-                        if (d == 0) {
-                            done_window = true;
-                        }
-                    }
-                }
-
-                if (mode == InterpolateMode::NearestAvg) {
-                    int64_t window_size = 1;
-                    for (size_t i = 0; i < static_cast<size_t>(output.dim()); ++i) {
-                        window_size *= (input_end[i] - input_start[i]);
-                    }
-                    value /= static_cast<T>(window_size);
-                }
-
-                output[flat_out] = value;
             }
+            const T* src = input.data();
+            T* dst       = output.data();
+            for_rows(1, [&](int64_t row, const std::vector<int64_t>& row_coord) {
+                std::vector<int64_t> start(rank);
+                std::vector<int64_t> end(rank);
+                std::vector<int64_t> current(rank);
+                for (size_t i = 1; i < rank; ++i) {
+                    start[i] = window_starts[i][static_cast<size_t>(row_coord[i])];
+                    end[i]   = window_ends[i][static_cast<size_t>(row_coord[i])];
+                }
+                for (int64_t x = 0; x < row_length; ++x) {
+                    start[0] = window_starts[0][static_cast<size_t>(x)];
+                    end[0]   = window_ends[0][static_cast<size_t>(x)];
+                    current  = start;
+                    T value  = init_reduction();
+                    for (bool done_window = false; !done_window;) {
+                        int64_t offset = 0;
+                        for (size_t i = 0; i < rank; ++i) {
+                            offset += current[i] * input_strides[i];
+                        }
+                        reduce_value(value, src[offset]);
+                        for (int d = static_cast<int>(rank) - 1; d >= 0; --d) {
+                            if (++current[d] < end[d]) {
+                                break;
+                            }
+                            current[d] = start[d];
+                            if (d == 0) {
+                                done_window = true;
+                            }
+                        }
+                    }
+                    if (mode == InterpolateMode::NearestAvg) {
+                        int64_t window_size = 1;
+                        for (size_t i = 0; i < rank; ++i) {
+                            window_size *= (end[i] - start[i]);
+                        }
+                        value /= static_cast<T>(window_size);
+                    }
+                    dst[row * row_length + x] = value;
+                }
+            });
 
             return output;
         }

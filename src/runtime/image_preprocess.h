@@ -65,6 +65,7 @@ namespace sd {
         bool fail(const std::string& message) const;
         std::map<std::string, std::string> resolve_options(ImageTarget target, int index) const;
         Tensor<float> apply_transform(const Tensor<float>& image, const std::map<std::string, std::string>& options, ImageTransform plan, const std::string& label, ops::InterpolateMode default_filter) const;
+        bool plan_geometry(int source_width, int source_height, int channels, const std::map<std::string, std::string>& options, const std::string& label, int width, int height, ImageResizeMode default_mode, ImageTransform& plan) const;
 
         bool prepare_image(sd_image_t& image, ImageTarget target, int index, int width, int height);
         bool prepare_array(sd_image_t*& images, int count, ImageTarget target, std::vector<sd_image_t>& storage, int width = -1, int height = -1);
@@ -80,7 +81,8 @@ namespace sd {
         bool validate_inputs(const sd_img_gen_params_t& params) const;
         bool validate_inputs(const sd_vid_gen_params_t& params) const;
         Tensor<float> apply_geometry(const Tensor<float>& image, ImageTarget target, int index, int width, int height, ImageResizeMode default_mode = ImageResizeMode::Stretch, ops::InterpolateMode default_filter = ops::InterpolateMode::Nearest, ImageTransform* plan_out = nullptr) const;
-        Tensor<float> preprocess_input(sd_image_t image, ImageTarget target, int index = 0, int width = -1, int height = -1);
+        // unchanged: when given, set instead of returning a tensor if the image needs no change at all.
+        Tensor<float> preprocess_input(sd_image_t image, ImageTarget target, int index = 0, int width = -1, int height = -1, bool* unchanged = nullptr);
     };
 
 }  // namespace sd

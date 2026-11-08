@@ -838,17 +838,26 @@ sd::Tensor<float> sd_image_to_tensor(sd_image_t image,
                                      int target_width,
                                      int target_height,
                                      bool scale) {
-    sd::Tensor<float> tensor = sd::zeros<float>({static_cast<int64_t>(image.width),
-                                                 static_cast<int64_t>(image.height),
-                                                 static_cast<int64_t>(image.channel),
-                                                 1});
-    for (uint32_t iw = 0; iw < image.width; ++iw) {
-        for (uint32_t ih = 0; ih < image.height; ++ih) {
-            for (uint32_t ic = 0; ic < image.channel; ++ic) {
-                tensor.index(iw, ih, ic, 0) = sd_image_get_f32(image, iw, ih, ic, scale);
+    const int64_t width      = image.width;
+    const int64_t height     = image.height;
+    const int64_t channel    = image.channel;
+    sd::Tensor<float> tensor = sd::zeros<float>({width, height, channel, 1});
+    float* dst               = tensor.data();
+    sd::parallel_for(0, height, 32, [&](int64_t row_begin, int64_t row_end) {
+        for (int64_t c = 0; c < channel; ++c) {
+            for (int64_t y = row_begin; y < row_end; ++y) {
+                const uint8_t* in = image.data + y * width * channel + c;
+                float* out        = dst + (c * height + y) * width;
+                for (int64_t x = 0; x < width; ++x) {
+                    float value = in[x * channel];
+                    if (scale) {
+                        value /= 255.f;
+                    }
+                    out[x] = value;
+                }
             }
         }
-    }
+    });
     if (target_width >= 0 && target_height >= 0 &&
         (tensor.shape()[0] != target_width || tensor.shape()[1] != target_height)) {
         tensor = sd::ops::interpolate(tensor,
