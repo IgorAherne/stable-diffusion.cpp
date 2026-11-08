@@ -541,6 +541,16 @@ typedef struct {
 SD_API void sd_albedo_params_init(sd_albedo_params_t* params);
 // One RGB picture, freed with free_sd_images(result, 1); NULL on failure (the log says why).
 SD_API sd_image_t* sd_albedo(sd_ctx_t* sd_ctx, const sd_albedo_params_t* params);
+// generate_image, then sd_albedo of its first picture's RGB channels (its alpha left out, as a caller that saves the
+// picture and reads it back as RGB gives it): the same two calls in one, without the caller's round trip between
+// them. albedo_params->image is ignored. *albedo_out: one RGB picture (free_sd_images(*albedo_out, 1)), or NULL when
+// the albedo failed (the log says why) while the pictures were made; returns what generate_image returns.
+SD_API bool generate_image_albedo(sd_ctx_t* sd_ctx,
+                                  const sd_img_gen_params_t* sd_img_gen_params,
+                                  const sd_albedo_params_t* albedo_params,
+                                  sd_image_t** images_out,
+                                  int* num_images_out,
+                                  sd_image_t** albedo_out);
 
 enum sd_cancel_mode_t {
     // Stop the current generation as soon as possible.

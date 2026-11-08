@@ -768,6 +768,42 @@ SD_API sd_image_t* sd_albedo(sd_ctx_t* sd_ctx, const sd_albedo_params_t* params)
     return sd::pipeline::albedo(sd_ctx->sd, params);
 }
 
+SD_API bool generate_image_albedo(sd_ctx_t* sd_ctx,
+                                  const sd_img_gen_params_t* params,
+                                  const sd_albedo_params_t* albedo_params,
+                                  sd_image_t** images_out,
+                                  int* num_images_out,
+                                  sd_image_t** albedo_out) {
+    if (albedo_out != nullptr)
+        *albedo_out = nullptr;
+    if (albedo_params == nullptr || albedo_out == nullptr || images_out == nullptr || num_images_out == nullptr) {
+        if (images_out != nullptr)
+            *images_out = nullptr;
+        if (num_images_out != nullptr)
+            *num_images_out = 0;
+        return false;
+    }
+    if (!generate_image(sd_ctx, params, images_out, num_images_out)) {
+        return false;
+    }
+    if (*images_out == nullptr || *num_images_out < 1 || (*images_out)[0].data == nullptr ||
+        (*images_out)[0].channel < 3) {
+        return true;
+    }
+    const sd_image_t& picture = (*images_out)[0];
+    const size_t pixels       = static_cast<size_t>(picture.width) * picture.height;
+    std::vector<uint8_t> rgb(pixels * 3);
+    for (size_t i = 0; i < pixels; ++i) {
+        for (int c = 0; c < 3; ++c) {
+            rgb[i * 3 + c] = picture.data[i * picture.channel + c];
+        }
+    }
+    sd_albedo_params_t albedo = *albedo_params;
+    albedo.image              = {picture.width, picture.height, 3, rgb.data()};
+    *albedo_out               = sd_albedo(sd_ctx, &albedo);
+    return true;
+}
+
 SD_API bool generate_video(sd_ctx_t* sd_ctx,
                            const sd_vid_gen_params_t* sd_vid_gen_params,
                            sd_image_t** frames_out,
