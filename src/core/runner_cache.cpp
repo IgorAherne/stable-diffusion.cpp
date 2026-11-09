@@ -27,7 +27,8 @@ namespace sd {
     std::unique_ptr<CachedTensor> CachedTensor::copy(ggml_backend_t backend,
                                                      const std::string& name,
                                                      ggml_tensor* source,
-                                                     ggml_status& status) {
+                                                     ggml_status& status,
+                                                     ggml_backend_buffer_t reuse) {
         status = GGML_STATUS_FAILED;
         if (ggml_graph_cut::tensor_buffer(source) == nullptr) {
             return nullptr;
@@ -42,7 +43,16 @@ namespace sd {
         // Cut views are rebound with their original strides and offsets.
         std::copy(std::begin(source->nb), std::end(source->nb), std::begin(entry->tensor->nb));
         ggml_set_name(entry->tensor, name.c_str());
-        entry->buffer = ggml_backend_alloc_ctx_tensors(entry->context, backend);
+        if (reuse != nullptr) {
+            // (the caller checked its type and size; its old tensor's context is gone)
+            if (ggml_backend_tensor_alloc(reuse, entry->tensor, ggml_backend_buffer_get_base(reuse)) != GGML_STATUS_SUCCESS) {
+                ggml_backend_buffer_free(reuse);
+                return nullptr;
+            }
+            entry->buffer = reuse;
+        } else {
+            entry->buffer = ggml_backend_alloc_ctx_tensors(entry->context, backend);
+        }
         if (entry->buffer == nullptr) {
             return nullptr;
         }
@@ -51,7 +61,9 @@ namespace sd {
             ggml_backend_tensor_get(source, data.data(), 0, data.size());
             ggml_backend_tensor_set(entry->tensor, data.data(), 0, data.size());
         } else {
-            ggml_backend_tensor_copy(source, entry->tensor);
+            // On the backend's stream, after the graph that wrote the source; both callers synchronize once after
+            // all their copies (a blocking copy waited for each, ~2 ms under WDDM, three a segment of a cut graph).
+            ggml_backend_tensor_copy_async(backend, backend, source, entry->tensor);
         }
         status = GGML_STATUS_SUCCESS;
         return entry;
@@ -158,7 +170,16 @@ namespace sd {
     }
 
     size_t GraphCutTensorCache::resident_bytes(ggml_backend_dev_t device) const {
-        return sd::resident_bytes(tensors_, device);
+        size_t bytes = sd::resident_bytes(tensors_, device);
+        for (const auto& spare : spare_) {
+            auto buffer = spare->buffer;
+            if (buffer != nullptr && !ggml_backend_buffer_is_host(buffer) &&
+                ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buffer)) == device) {
+                const size_t size = ggml_backend_buffer_get_size(buffer);
+                bytes             = size > SIZE_MAX - bytes ? SIZE_MAX : bytes + size;
+            }
+        }
+        return bytes;
     }
 
     size_t GraphCutTensorCache::estimate_output_bytes(
@@ -187,7 +208,15 @@ namespace sd {
 
     void GraphCutTensorCache::prune(const std::unordered_set<std::string>& keep_names) {
         for (auto it = tensors_.begin(); it != tensors_.end();) {
-            it = keep_names.count(it->first) ? std::next(it) : tensors_.erase(it);
+            if (keep_names.count(it->first)) {
+                ++it;
+                continue;
+            }
+            if (spare_.size() < 2 && it->second != nullptr && it->second->buffer != nullptr &&
+                !ggml_backend_buffer_is_host(it->second->buffer)) {
+                spare_.push_back(std::move(it->second));
+            }
+            it = tensors_.erase(it);
         }
     }
 
@@ -203,7 +232,21 @@ namespace sd {
                 continue;
             }
             ggml_status status;
-            auto entry = CachedTensor::copy(backend_, output->name, ggml_graph_cut::cache_source_tensor(output), status);
+            ggml_tensor* source         = ggml_graph_cut::cache_source_tensor(output);
+            ggml_backend_buffer_t reuse = nullptr;
+            ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend_);
+            const size_t need           = buft != nullptr ? ggml_backend_buft_get_alloc_size(buft, source) : 0;
+            for (auto spare = spare_.begin(); spare != spare_.end() && need > 0; ++spare) {
+                ggml_backend_buffer_t buffer = (*spare)->buffer;
+                if (ggml_backend_buffer_get_type(buffer) == buft &&
+                    ggml_backend_buffer_get_size(buffer) == GGML_PAD(need, ggml_backend_buft_get_alignment(buft))) {
+                    reuse              = buffer;
+                    (*spare)->buffer   = nullptr;  // (~CachedTensor frees its context only)
+                    spare_.erase(spare);
+                    break;
+                }
+            }
+            auto entry = CachedTensor::copy(backend_, output->name, source, status, reuse);
             if (entry == nullptr) {
                 LOG_ERROR("%s failed to capture graph cut tensor: %s", log_desc, output->name);
                 return status;

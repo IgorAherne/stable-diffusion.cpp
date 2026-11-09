@@ -6,6 +6,7 @@
 #include <memory>
 #include <string>
 #include <unordered_set>
+#include <vector>
 
 #include "ggml-backend.h"
 
@@ -22,7 +23,8 @@ namespace sd {
         static std::unique_ptr<CachedTensor> copy(ggml_backend_t backend,
                                                   const std::string& name,
                                                   ggml_tensor* source,
-                                                  ggml_status& status);
+                                                  ggml_status& status,
+                                                  ggml_backend_buffer_t reuse = nullptr);
     };
     using CachedTensors = std::map<std::string, std::unique_ptr<CachedTensor>>;
 
@@ -54,6 +56,10 @@ namespace sd {
     class GraphCutTensorCache {
         ggml_backend_t backend_;
         CachedTensors tensors_;
+        // Buffers of pruned cuts, for the next capture of the same size: a cut graph's segments pass on equal-sized
+        // tensors, and a new device buffer is filled with zeros by the driver at its first use (Windows: ~24 ms a
+        // GB). Freed with the graph's end (clear).
+        std::vector<std::unique_ptr<CachedTensor>> spare_;
 
     public:
         explicit GraphCutTensorCache(ggml_backend_t backend)
@@ -64,7 +70,10 @@ namespace sd {
                                      const ggml_graph_cut::Segment& segment) const;
         ggml_status capture(ggml_cgraph* graph, const ggml_graph_cut::Segment& segment, const char* log_desc);
         void prune(const std::unordered_set<std::string>& keep_names);
-        void clear() { tensors_.clear(); }
+        void clear() {
+            tensors_.clear();
+            spare_.clear();
+        }
     };
 }
 
