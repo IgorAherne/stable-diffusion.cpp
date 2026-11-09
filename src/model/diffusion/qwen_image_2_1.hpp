@@ -864,6 +864,13 @@ namespace Qwen {
         // follow ran ~2x slower (the card's memory left in another state; not understood yet), a net loss.
         bool prefix_pass_enabled = false;
 
+        // SD_QWEN_PREFIX_DROP=1 (read per sampling run): the run's prefixes are freed at its end even where they are
+        // kept (keep_prefixes still decides how a step computes, so the pictures stay the same) - for a caller whose
+        // next request never has the same prefix (SuperTexture: every view's start picture and mask are new). Their
+        // ~3 GB then do not crowd the decode and the albedo pass after the run, which otherwise evict the diffusion
+        // weights to make room and copy them back for the next pass.
+        bool drop_prefixes_after_run = false;
+
         // The prefixes whose K/V the cache holds, with copies of everything those were computed from (when kept):
         // matched by content, as the tensors behind the engine's prefix ids are new for every request. The K/V do not
         // depend on the seed or the timestep.
@@ -1249,7 +1256,7 @@ namespace Qwen {
         }
 
         bool retain_cache_entry(const std::string& name) const override {
-            return keep_prefixes() && owns_prefix_entry(name);
+            return keep_prefixes() && !drop_prefixes_after_run && owns_prefix_entry(name);
         }
 
         // Frees the K/V of the prefixes the current run has not used.
@@ -1368,6 +1375,8 @@ namespace Qwen {
                 // setting.
                 const char* prefix_pass_env = std::getenv("SD_QWEN_PREFIX_PASS");
                 prefix_pass_enabled         = prefix_pass_env != nullptr && std::strcmp(prefix_pass_env, "1") == 0;
+                const char* prefix_drop_env = std::getenv("SD_QWEN_PREFIX_DROP");
+                drop_prefixes_after_run     = prefix_drop_env != nullptr && std::strcmp(prefix_drop_env, "1") == 0;
                 block_cache_states.clear();
                 block_cache_disabled           = false;
                 block_cache_unavailable_logged = false;
