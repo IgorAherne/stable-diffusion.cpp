@@ -859,9 +859,11 @@ namespace Qwen {
         // prefix rows changed the picture). So only where W8A8 takes the drawn picture's rows
         // (w8a8_takes_block_products) and the prefix is at least as long, the case measured, and with a cache the
         // pass's stand-in attention takes (qwen_image_2_1_prefix_pass_attends).
-        // Off unless SD_QWEN_PREFIX_PASS=1 (read per sampling run): on a 12 GB RTX 3060 it saved 0.7 s of a
-        // SuperTexture view's first step, but with five example pictures the VAE encodes and the albedo decode that
-        // follow ran ~2x slower (the card's memory left in another state; not understood yet), a net loss.
+        // Off unless SD_QWEN_PREFIX_PASS=1 (read per sampling run; Spellcast3D's launcher sets it on sm_80+): on a
+        // 12 GB RTX 3060 it saves ~0.5 s of a SuperTexture view's first step. The VAE graphs after it once ran ~2x
+        // slower: the process at ~10.9 GB of the card, the driver had put a 64 MB allocation in shared system memory
+        // (WDDM's sysmem fallback: the process's "Shared Usage" counter +64 MB while they were slow); with the run's
+        // prefix freed at its end (SD_QWEN_PREFIX_DROP) the decode and the albedo pass stay ~3 GB further from it.
         bool prefix_pass_enabled = false;
 
         // SD_QWEN_PREFIX_DROP=1 (read per sampling run): the run's prefixes are freed at its end even where they are
