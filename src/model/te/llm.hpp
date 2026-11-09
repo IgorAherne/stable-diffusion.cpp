@@ -2492,8 +2492,10 @@ namespace LLM {
                                    return_all_hidden_states,
                                    position_ids);
             };
-            return restore_trailing_singleton_dims(GGMLRunner::compute(get_graph, n_threads, auto_runner_end),
-                                                   input_ids.dim() + 1);
+            set_graph_kind("text");  // (prefetch_graph_kind: its weights can be copied ahead)
+            auto hidden = GGMLRunner::compute(get_graph, n_threads, auto_runner_end);
+            set_graph_kind("");
+            return restore_trailing_singleton_dims(std::move(hidden), input_ids.dim() + 1);
         }
 
         // LLaDA-Image's QueryFormer consumes the raw token embeddings before the backbone runs,
@@ -2704,7 +2706,9 @@ namespace LLM {
             auto get_graph = [&]() -> ggml_cgraph* {
                 return build_encode_image_outputs_graph(image);
             };
+            set_graph_kind("vision");
             auto combined = take_or_empty(GGMLRunner::compute(get_graph, n_threads, auto_runner_end));
+            set_graph_kind("");
             if (combined.empty()) {
                 return {};
             }

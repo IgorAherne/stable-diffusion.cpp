@@ -196,8 +196,12 @@ namespace sd {
     }
 
     void SegmentWeightPipeline::clear() {
-        if (auto manager = residency_manager_.lock()) {
-            manager->clear_prefetched_params(owner_id_);
+        // Only a copy this pipeline scheduled: its runner may have one under way for a later graph under the same
+        // owner (GGMLRunner::prefetch_graph_kind), which this graph's end must leave running.
+        if (queued_segment_ != SIZE_MAX || !queued_params_.empty()) {
+            if (auto manager = residency_manager_.lock()) {
+                manager->clear_prefetched_params(owner_id_);
+            }
         }
         queued_params_.clear();
         queued_segment_ = SIZE_MAX;

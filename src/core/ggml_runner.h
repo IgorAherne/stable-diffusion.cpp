@@ -162,6 +162,12 @@ private:
               const std::vector<ggml_tensor*>& params) const;
     bool execute_segment(ggml_cgraph* graph, int n_threads);
     void update_retained_cache_reclaimer();
+    // Graph kinds (set_graph_kind): the weights the last graph of each kind took, and the weights copied ahead for
+    // one kind (prefetch_graph_kind) that the next graph taking any of them activates.
+    std::string graph_kind_;
+    std::map<std::string, std::vector<ggml_tensor*>> kind_params_;
+    std::vector<ggml_tensor*> prefetched_params_;
+    void activate_prefetched_for(const std::vector<ggml_tensor*>& params);
     std::optional<sd::Tensor<float>> execute_graph(ggml_cgraph* graph, int n_threads, bool no_return, const std::function<bool()>& read_outputs);
 
 protected:
@@ -373,6 +379,17 @@ public:
                                              const std::function<bool()>& read_outputs = {});
 
     ggml_status last_compute_status() const { return last_compute_status_; }
+
+    // The kind of the graphs this runner computes next (e.g. "vision", "text"; "" = none): the weights each kind's
+    // last graph took are remembered, so that a later graph of a kind can have its weights copied to the card ahead.
+    void set_graph_kind(const char* kind) { graph_kind_ = kind != nullptr ? kind : ""; }
+
+    // The weights the last graph of `kind` took, copied to the card now on the residency manager's transfer stream
+    // (ModelManager::prefetch_params) while this runner's other graphs run; the next graph that takes any of them
+    // finds them staged (the same bytes the staging would copy then, so the same results). Only when they fit beside
+    // what is on the card, `headroom_bytes` more kept free, without evicting anything; a no-op otherwise.
+    // -> whether a copy was scheduled.
+    bool prefetch_graph_kind(const char* kind, size_t headroom_bytes);
 
     void set_flash_attention_enabled(bool enabled) {
         flash_attn_enabled = enabled;

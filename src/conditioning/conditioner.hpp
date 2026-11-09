@@ -1952,6 +1952,10 @@ struct AnimaConditioner : public Conditioner {
     }
 };
 
+// Kept free beside the text model's weights copied ahead (Qwen Image 2.1): the vision tower's weights (1.1 GB for
+// Qwen3-VL-8B's F16 mmproj) and the vision / text graphs' buffers (0.3 + 0.46 GB at 704x704 and ~1,500 tokens).
+constexpr size_t QWEN21_TEXT_PREFETCH_HEADROOM = 2048ULL * 1024ULL * 1024ULL;
+
 struct LLMEmbedder : public Conditioner {
     SDVersion version;
     std::shared_ptr<Tokenizer> tokenizer;
@@ -2622,6 +2626,12 @@ struct LLMEmbedder : public Conditioner {
             out_layers                       = {static_cast<int>(llm->config.num_layers)};
             prompt += "<|im_start|>user\n";
             if (llm->enable_vision && conditioner_params.ref_images != nullptr) {
+                if (!conditioner_params.ref_images->empty()) {
+                    // The text model's weights go to the card while the vision tower reads the pictures, instead of
+                    // at the text graph's start (~0.3 s from page-locked RAM on an RTX 3060); only where they fit
+                    // without evicting anything.
+                    llm->prefetch_graph_kind("text", QWEN21_TEXT_PREFETCH_HEADROOM);
+                }
                 for (size_t i = 0; i < conditioner_params.ref_images->size(); ++i) {
                     const auto& image = (*conditioner_params.ref_images)[i];
                     int64_t width     = image.shape()[0];

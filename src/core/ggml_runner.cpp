@@ -40,6 +40,8 @@ void GGMLRunner::alloc_params_ctx() {
     GGML_ASSERT(params_ctx != nullptr);
     params_tensor_set_.clear();
     params_tensor_set_dirty_ = true;
+    kind_params_.clear();
+    prefetched_params_.clear();
 }
 
 void GGMLRunner::free_params_ctx() {
@@ -49,6 +51,8 @@ void GGMLRunner::free_params_ctx() {
     }
     params_tensor_set_.clear();
     params_tensor_set_dirty_ = true;
+    kind_params_.clear();
+    prefetched_params_.clear();
 }
 
 void GGMLRunner::alloc_compute_ctx() {
@@ -518,6 +522,7 @@ void GGMLRunner::runner_end() {
     cache_.retain([this](const std::string& name) { return retain_cache_entry(name); });
     logged_compute_bytes_.clear();
     logged_segment_count_ = 0;
+    prefetched_params_.clear();
     if (auto manager = residency_manager.lock()) {
         manager->clear_prefetched_params(reinterpret_cast<uintptr_t>(this));
         std::vector<ggml_tensor*> tensors;
@@ -875,11 +880,69 @@ bool GGMLRunner::execute_segment(ggml_cgraph* graph, int n_threads) {
     return true;
 }
 
+void GGMLRunner::activate_prefetched_for(const std::vector<ggml_tensor*>& params) {
+    if (prefetched_params_.empty()) {
+        return;
+    }
+    const std::unordered_set<const ggml_tensor*> ahead(prefetched_params_.begin(), prefetched_params_.end());
+    if (std::none_of(params.begin(), params.end(), [&](const ggml_tensor* t) { return ahead.count(t) != 0; })) {
+        return;  // another graph (the copy keeps running beside it)
+    }
+    auto manager = residency_manager.lock();
+    if (manager != nullptr && !manager->activate_prefetched_params(reinterpret_cast<uintptr_t>(this), prefetched_params_)) {
+        manager->clear_prefetched_params(reinterpret_cast<uintptr_t>(this));  // staged the usual way below
+    }
+    prefetched_params_.clear();
+}
+
+bool GGMLRunner::prefetch_graph_kind(const char* kind, size_t headroom_bytes) {
+    auto manager = residency_manager.lock();
+    auto found   = kind_params_.find(kind != nullptr ? kind : "");
+    if (manager == nullptr || !manager->prefetch_enabled() || found == kind_params_.end() || found->second.empty() ||
+        !prefetched_params_.empty() || runtime_backend == nullptr || sd_backend_is_cpu(runtime_backend) ||
+        is_multi_device()) {
+        return false;
+    }
+    rebuild_params_tensor_set();
+    for (ggml_tensor* tensor : found->second) {
+        if (params_tensor_set_.count(tensor) == 0) {  // the params were made again since
+            kind_params_.erase(found);
+            return false;
+        }
+    }
+    DeviceMemoryRequest request;
+    request.compute_backend          = runtime_backend;
+    request.owner_id                 = reinterpret_cast<uintptr_t>(this);
+    request.pending_allocation_bytes = headroom_bytes;
+    if (!manager->fits_compute_backend_capacity(request, found->second)) {
+        // Room made as the graph's own staging would make it (idle weights of other runners, least recently used
+        // first), this runner's remembered weights kept; only where the card holds them with the headroom at all.
+        std::vector<ggml_tensor*> keep = found->second;
+        for (const auto& entry : kind_params_) {
+            keep.insert(keep.end(), entry.second.begin(), entry.second.end());
+        }
+        if (!manager->ensure_compute_backend_capacity(request, found->second, {}, keep)) {
+            return false;
+        }
+    }
+    if (manager->prefetch_params(reinterpret_cast<uintptr_t>(this), found->second) != WeightPrefetchResult::Scheduled) {
+        manager->clear_prefetched_params(reinterpret_cast<uintptr_t>(this));
+        return false;
+    }
+    prefetched_params_ = found->second;
+    LOG_DEBUG("%s copying the weights of its next %s graph ahead (%zu tensors)", get_desc().c_str(), kind, prefetched_params_.size());
+    return true;
+}
+
 std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n_threads, bool no_return, const std::function<bool()>& read_outputs) {
     if (!assign_graph_cut_layer_split_backends(graph)) {
         return std::nullopt;
     }
     const auto params           = collect_used_param_tensors(graph);
+    if (!graph_kind_.empty()) {
+        kind_params_[graph_kind_] = params;
+    }
+    activate_prefetched_for(params);
     const auto& cached_plan     = resolve_graph_cut_plan(graph);
     const auto full_measurement = measure(graph, cached_plan.compute_buffer_size);
     if (full_measurement.buffers.empty()) {
