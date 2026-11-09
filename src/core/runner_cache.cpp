@@ -191,7 +191,13 @@ namespace sd {
             return SIZE_MAX;
         }
         const size_t alignment = ggml_backend_buft_get_alignment(buffer_type);
-        size_t total_size      = 0;
+        // An output that capture() will place in a spare buffer allocates nothing: the spare is already counted in
+        // resident_bytes. The same greedy matching as capture's.
+        std::vector<ggml_backend_buffer_t> spares;
+        for (const auto& spare : spare_) {
+            spares.push_back(spare->buffer);
+        }
+        size_t total_size = 0;
         for (size_t output_idx = 0; output_idx < segment.output_node_indices.size(); ++output_idx) {
             ggml_tensor* output = ggml_graph_cut::output_tensor(graph, segment, output_idx);
             if (output == nullptr || !ggml_graph_cut::is_graph_cut_tensor(output) ||
@@ -199,8 +205,17 @@ namespace sd {
                 continue;
             }
             ggml_tensor* source      = ggml_graph_cut::cache_source_tensor(output);
-            const size_t tensor_size = GGML_PAD(
-                ggml_backend_buft_get_alloc_size(buffer_type, source), alignment);
+            const size_t need        = ggml_backend_buft_get_alloc_size(buffer_type, source);
+            const size_t tensor_size = GGML_PAD(need, alignment);
+            auto spare               = need == 0 ? spares.end()
+                                                 : std::find_if(spares.begin(), spares.end(), [&](ggml_backend_buffer_t buffer) {
+                                                       return ggml_backend_buffer_get_type(buffer) == buffer_type &&
+                                                              ggml_backend_buffer_get_size(buffer) == tensor_size;
+                                                   });
+            if (spare != spares.end()) {
+                spares.erase(spare);
+                continue;
+            }
             total_size = tensor_size > SIZE_MAX - total_size ? SIZE_MAX : total_size + tensor_size;
         }
         return total_size;
