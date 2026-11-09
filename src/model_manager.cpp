@@ -1967,11 +1967,79 @@ bool ModelManager::fits_compute_backend_capacity(
            check_capacity(request, states).fits();
 }
 
+bool ModelManager::is_evictable_state(const TensorState* state,
+                                      ggml_backend_t compute_backend,
+                                      const std::unordered_set<TensorState*>& protected_states) const {
+    if (state == nullptr || state->compute_backend != compute_backend || state->pin_count > 0 ||
+        protected_states.find(const_cast<TensorState*>(state)) != protected_states.end()) {
+        return false;
+    }
+    const bool reloadable = state->residency_mode == ResidencyMode::Disk ||
+                            state->compute_backend != state->params_backend;
+    const bool resident   = state->compute_backend == state->params_backend
+                                ? state->loaded_to_params_backend
+                                : state->staged_to_compute_backend;
+    return reloadable && resident;
+}
+
+size_t ModelManager::evictable_bytes(ggml_backend_t compute_backend,
+                                     const std::unordered_set<TensorState*>& protected_states) const {
+    ggml_backend_dev_t device = compute_backend != nullptr ? ggml_backend_get_device(compute_backend) : nullptr;
+    auto device_bytes         = [&](ggml_backend_buffer_t buffer) -> size_t {
+        if (device == nullptr || buffer == nullptr || ggml_backend_buffer_is_host(buffer)) {
+            return 0;
+        }
+        ggml_backend_buffer_type_t buffer_type = ggml_backend_buffer_get_type(buffer);
+        if (buffer_type == nullptr || split_buffer_devices_.count(buffer_type) != 0 ||
+            ggml_backend_buft_get_device(buffer_type) != device) {
+            return 0;
+        }
+        return ggml_backend_buffer_get_size(buffer);
+    };
+    auto add   = [](size_t a, size_t b) { return b > SIZE_MAX - a ? SIZE_MAX : a + b; };
+    size_t sum = 0;
+    // As release_compute_staging_blocks / release_params_storage_blocks free them for an eviction set.
+    for (const auto& block : compute_staging_blocks_) {
+        if (block != nullptr &&
+            std::all_of(block->staged_tensors.begin(), block->staged_tensors.end(), [&](const auto& pair) {
+                return pair.first == nullptr || is_evictable_state(pair.first, compute_backend, protected_states);
+            })) {
+            sum = add(sum, device_bytes(block->buffer));
+        }
+    }
+    for (const auto& block : params_storage_blocks_) {
+        if (block != nullptr &&
+            std::all_of(block->states.begin(), block->states.end(), [&](const TensorState* state) {
+                return state == nullptr ||
+                       (is_evictable_state(state, compute_backend, protected_states) &&
+                        !state->staged_to_compute_backend && state->residency_mode == ResidencyMode::Disk);
+            })) {
+            sum = add(sum, device_bytes(block->buffer));
+        }
+    }
+    return sum;
+}
+
 bool ModelManager::ensure_compute_backend_capacity(
     const DeviceMemoryRequest& request,
     const std::vector<ggml_tensor*>& required_params,
     const std::vector<std::vector<ggml_tensor*>>& preferred_eviction_order,
     const std::vector<ggml_tensor*>& protected_params) {
+    return make_compute_backend_capacity(request, required_params, preferred_eviction_order, protected_params, false);
+}
+
+bool ModelManager::make_room_for_prefetch(const DeviceMemoryRequest& request,
+                                          const std::vector<ggml_tensor*>& required_params,
+                                          const std::vector<ggml_tensor*>& protected_params) {
+    return make_compute_backend_capacity(request, required_params, {}, protected_params, true);
+}
+
+bool ModelManager::make_compute_backend_capacity(
+    const DeviceMemoryRequest& request,
+    const std::vector<ggml_tensor*>& required_params,
+    const std::vector<std::vector<ggml_tensor*>>& preferred_eviction_order,
+    const std::vector<ggml_tensor*>& protected_params,
+    bool for_prefetch) {
     std::vector<TensorState*> required_states;
     if (!resolve_required_tensor_states(required_params, required_states, request.compute_backend)) {
         return false;
@@ -2003,7 +2071,7 @@ bool ModelManager::ensure_compute_backend_capacity(
         }
         return false;
     };
-    if (!keeps_staged_params() && reclaim_others()) {
+    if (!for_prefetch && !keeps_staged_params() && reclaim_others()) {
         return true;
     }
 
@@ -2018,19 +2086,22 @@ bool ModelManager::ensure_compute_backend_capacity(
             protected_states.insert(entry.second->states.begin(), entry.second->states.end());
         }
     }
+    if (for_prefetch) {
+        // A copy ahead of need evicts nothing unless the eviction is sure to make its room.
+        const size_t freeable = evictable_bytes(compute_backend, protected_states);
+        const auto capacity   = check_capacity(request, required_states);
+        auto grown            = [&](size_t available) {
+            return available == SIZE_MAX || freeable > SIZE_MAX - available ? SIZE_MAX : available + freeable;
+        };
+        if (capacity.required_device_bytes > grown(capacity.available_device_bytes) ||
+            capacity.required_budget_bytes > grown(capacity.available_budget_bytes)) {
+            return false;
+        }
+    }
 
     std::unordered_set<TensorState*> eviction_states;
     auto add_evictable_state = [&](TensorState* state) {
-        if (state == nullptr || state->compute_backend != compute_backend ||
-            state->pin_count > 0 || protected_states.find(state) != protected_states.end()) {
-            return;
-        }
-        const bool reloadable = state->residency_mode == ResidencyMode::Disk ||
-                                state->compute_backend != state->params_backend;
-        const bool resident = state->compute_backend == state->params_backend
-                                  ? state->loaded_to_params_backend
-                                  : state->staged_to_compute_backend;
-        if (reloadable && resident) {
+        if (is_evictable_state(state, compute_backend, protected_states)) {
             eviction_states.insert(state);
         }
     };
@@ -2070,6 +2141,9 @@ bool ModelManager::ensure_compute_backend_capacity(
         if (release_eviction_states()) {
             return true;
         }
+    }
+    if (for_prefetch) {
+        return false;
     }
     if (keeps_staged_params() && reclaim_others()) {
         return true;

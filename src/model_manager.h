@@ -190,6 +190,18 @@ private:
     bool unregister_tensor_states(const std::unordered_set<TensorState*>& states, size_t* size);
     size_t other_runtime_resident_bytes(uintptr_t owner_id,
                                         ggml_backend_t compute_backend) const;
+    bool is_evictable_state(const TensorState* state,
+                            ggml_backend_t compute_backend,
+                            const std::unordered_set<TensorState*>& protected_states) const;
+    // The device bytes that evicting every evictable state (is_evictable_state) on compute_backend would free: the
+    // blocks all of whose weights are evictable; a lower bound.
+    size_t evictable_bytes(ggml_backend_t compute_backend,
+                           const std::unordered_set<TensorState*>& protected_states) const;
+    bool make_compute_backend_capacity(const DeviceMemoryRequest& request,
+                                       const std::vector<ggml_tensor*>& required_params,
+                                       const std::vector<std::vector<ggml_tensor*>>& preferred_eviction_order,
+                                       const std::vector<ggml_tensor*>& protected_params,
+                                       bool for_prefetch);
 
 public:
     ~ModelManager() override;
@@ -307,6 +319,9 @@ public:
         const std::vector<ggml_tensor*>& required_params,
         const std::vector<std::vector<ggml_tensor*>>& preferred_eviction_order,
         const std::vector<ggml_tensor*>& protected_params) override;
+    bool make_room_for_prefetch(const DeviceMemoryRequest& request,
+                                const std::vector<ggml_tensor*>& required_params,
+                                const std::vector<ggml_tensor*>& protected_params) override;
     WeightPrefetchResult prefetch_params(
         uintptr_t owner_id,
         const std::vector<ggml_tensor*>& tensors) override;

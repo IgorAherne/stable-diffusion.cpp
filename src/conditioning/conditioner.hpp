@@ -2628,8 +2628,9 @@ struct LLMEmbedder : public Conditioner {
             if (llm->enable_vision && conditioner_params.ref_images != nullptr) {
                 if (!conditioner_params.ref_images->empty()) {
                     // The text model's weights go to the card while the vision tower reads the pictures, instead of
-                    // at the text graph's start (~0.3 s from page-locked RAM on an RTX 3060); only where they fit
-                    // without evicting anything.
+                    // at the text graph's start (~0.3 s from page-locked RAM on an RTX 3060). Only where they fit
+                    // with the headroom in the text encoder's budget, idle weights (e.g. kept DiT blocks) evicted
+                    // for them where that is sure to make the room; nothing is evicted otherwise.
                     llm->prefetch_graph_kind("text", QWEN21_TEXT_PREFETCH_HEADROOM);
                 }
                 for (size_t i = 0; i < conditioner_params.ref_images->size(); ++i) {

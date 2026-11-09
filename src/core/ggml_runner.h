@@ -168,6 +168,9 @@ private:
     std::map<std::string, std::vector<ggml_tensor*>> kind_params_;
     std::vector<ggml_tensor*> prefetched_params_;
     void activate_prefetched_for(const std::vector<ggml_tensor*>& params);
+    // A copy ahead still waiting for its graph freed (a graph of this runner short of memory, or the run's end).
+    // -> whether there was one.
+    bool drop_pending_prefetch();
     std::optional<sd::Tensor<float>> execute_graph(ggml_cgraph* graph, int n_threads, bool no_return, const std::function<bool()>& read_outputs);
 
 protected:
@@ -386,9 +389,12 @@ public:
 
     // The weights the last graph of `kind` took, copied to the card now on the residency manager's transfer stream
     // (ModelManager::prefetch_params) while this runner's other graphs run; the next graph that takes any of them
-    // finds them staged (the same bytes the staging would copy then, so the same results). Only when they fit beside
-    // what is on the card, `headroom_bytes` more kept free, without evicting anything; a no-op otherwise.
-    // -> whether a copy was scheduled.
+    // finds them staged (the same bytes the staging would copy then, so the same results). Only where they fit with
+    // `headroom_bytes` more kept free, both on the card and in this runner's budget (max_graph_vram_bytes, as every
+    // graph of it): room is made by evicting other runners' idle weights, least recently used first (never this
+    // runner's remembered weights, nor another runner's cached tensors or working memory), and only where that is
+    // sure to make it; otherwise nothing is evicted and nothing copied. A graph of this runner that then runs short
+    // drops the copy (drop_pending_prefetch). -> whether a copy was scheduled.
     bool prefetch_graph_kind(const char* kind, size_t headroom_bytes);
 
     void set_flash_attention_enabled(bool enabled) {

@@ -514,6 +514,9 @@ void GGMLRunner::update_retained_cache_reclaimer() {
 
 void GGMLRunner::runner_end() {
     GGML_ASSERT(!graph_active_);
+    // Also a run that never started (a request that returned before this runner's first graph): the copy would
+    // otherwise stay on the card, counted and protected, until a later graph took it.
+    drop_pending_prefetch();
     if (!runner_started_) {
         return;
     }
@@ -522,7 +525,6 @@ void GGMLRunner::runner_end() {
     cache_.retain([this](const std::string& name) { return retain_cache_entry(name); });
     logged_compute_bytes_.clear();
     logged_segment_count_ = 0;
-    prefetched_params_.clear();
     if (auto manager = residency_manager.lock()) {
         manager->clear_prefetched_params(reinterpret_cast<uintptr_t>(this));
         std::vector<ggml_tensor*> tensors;
@@ -895,6 +897,17 @@ void GGMLRunner::activate_prefetched_for(const std::vector<ggml_tensor*>& params
     prefetched_params_.clear();
 }
 
+bool GGMLRunner::drop_pending_prefetch() {
+    if (prefetched_params_.empty()) {
+        return false;
+    }
+    prefetched_params_.clear();
+    if (auto manager = residency_manager.lock()) {
+        manager->clear_prefetched_params(reinterpret_cast<uintptr_t>(this));
+    }
+    return true;
+}
+
 bool GGMLRunner::prefetch_graph_kind(const char* kind, size_t headroom_bytes) {
     auto manager = residency_manager.lock();
     auto found   = kind_params_.find(kind != nullptr ? kind : "");
@@ -910,20 +923,22 @@ bool GGMLRunner::prefetch_graph_kind(const char* kind, size_t headroom_bytes) {
             return false;
         }
     }
+    // The budget every graph of this runner obeys (memory_requests): once scheduled, the copy counts as resident and
+    // cannot be evicted, so a copy outside the budget would leave this runner's next graphs short.
     DeviceMemoryRequest request;
     request.compute_backend          = runtime_backend;
     request.owner_id                 = reinterpret_cast<uintptr_t>(this);
     request.pending_allocation_bytes = headroom_bytes;
-    if (!manager->fits_compute_backend_capacity(request, found->second)) {
-        // Room made as the graph's own staging would make it (idle weights of other runners, least recently used
-        // first), this runner's remembered weights kept; only where the card holds them with the headroom at all.
-        std::vector<ggml_tensor*> keep = found->second;
-        for (const auto& entry : kind_params_) {
-            keep.insert(keep.end(), entry.second.begin(), entry.second.end());
-        }
-        if (!manager->ensure_compute_backend_capacity(request, found->second, {}, keep)) {
-            return false;
-        }
+    request.runtime_resident_bytes   = retained_runtime_buffer_bytes(runtime_backend);
+    request.max_backend_bytes        = max_graph_vram_bytes;
+    std::vector<ggml_tensor*> keep   = found->second;
+    for (const auto& entry : kind_params_) {
+        keep.insert(keep.end(), entry.second.begin(), entry.second.end());
+    }
+    if (!manager->make_room_for_prefetch(request, found->second, keep)) {
+        LOG_DEBUG("%s not copying the weights of its next %s graph ahead: no room for them with %.2f MB kept free",
+                  get_desc().c_str(), kind, headroom_bytes / (1024.0 * 1024.0));
+        return false;
     }
     if (manager->prefetch_params(reinterpret_cast<uintptr_t>(this), found->second) != WeightPrefetchResult::Scheduled) {
         manager->clear_prefetched_params(reinterpret_cast<uintptr_t>(this));
@@ -949,7 +964,7 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
         last_compute_status_ = GGML_STATUS_ALLOC_FAILED;
         return std::nullopt;
     }
-    auto fits_monolithic = [&]() {
+    auto check_monolithic = [&]() {
         // Planning headroom absorbs allocation estimate drift; execution keeps the normal limits.
         constexpr size_t planning_headroom = 128ULL * 1024ULL * 1024ULL;
         auto requests                      = memory_requests(full_measurement.buffers, cache_.pending_bytes(graph));
@@ -967,6 +982,8 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
         }
         return fits(requests, params);
     };
+    // A copy ahead for a later graph (prefetch_graph_kind) gives way to the graph that runs now.
+    auto fits_monolithic = [&]() { return check_monolithic() || (drop_pending_prefetch() && check_monolithic()); };
     auto manager         = residency_manager.lock();
     const bool segmented = !is_multi_device() && !sd_backend_is_cpu(runtime_backend) &&
                            manager != nullptr && manager->segmented_compute_enabled() &&
@@ -1062,7 +1079,12 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
                 sync_runtime_residency();
                 requests = memory_requests(measurement.buffers, new_cache_bytes);
             }
-            const bool ready = weights.ensure_segment_capacity(index, requests);
+            bool ready = weights.ensure_segment_capacity(index, requests);
+            if (!ready && drop_pending_prefetch()) {
+                sync_runtime_residency();
+                requests = memory_requests(measurement.buffers, new_cache_bytes);
+                ready    = weights.ensure_segment_capacity(index, requests);
+            }
             if (!ready && manager != nullptr) {
                 last_compute_status_ = GGML_STATUS_ALLOC_FAILED;
             }

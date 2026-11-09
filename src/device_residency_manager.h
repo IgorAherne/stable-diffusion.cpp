@@ -65,6 +65,16 @@ struct DeviceResidencyManager {
         const std::vector<ggml_tensor*>& required_params,
         const std::vector<std::vector<ggml_tensor*>>& preferred_eviction_order,
         const std::vector<ggml_tensor*>& protected_params) = 0;
+    // Room for weights copied ahead of their graph (a prefetch): like ensure_compute_backend_capacity, but only idle
+    // weights are evicted (least recently used first; never `protected_params`, never another runner's cached
+    // tensors or working memory), and only where evicting them is sure to make the room: where even all of them
+    // would not, nothing is evicted. The default evicts nothing. -> whether the request fits now.
+    virtual bool make_room_for_prefetch(const DeviceMemoryRequest& request,
+                                        const std::vector<ggml_tensor*>& required_params,
+                                        const std::vector<ggml_tensor*>& protected_params) {
+        (void)protected_params;
+        return fits_compute_backend_capacity(request, required_params);
+    }
     virtual WeightPrefetchResult prefetch_params(
         uintptr_t owner_id,
         const std::vector<ggml_tensor*>& tensors)                                     = 0;
