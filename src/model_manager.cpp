@@ -113,6 +113,16 @@ bool ModelManager::keeps_staged_params() const {
     return enabled;
 }
 
+static bool backend_supports_async_set(ggml_backend_t backend) {
+    ggml_backend_dev_t device = backend != nullptr ? ggml_backend_get_device(backend) : nullptr;
+    if (device == nullptr || sd_backend_is_cpu(backend)) {
+        return false;
+    }
+    ggml_backend_dev_props props{};
+    ggml_backend_dev_get_props(device, &props);
+    return props.caps.async;
+}
+
 static bool is_pinned_host_buffer_type(ggml_backend_buffer_type_t buft) {
     if (buft == nullptr || !ggml_backend_buft_is_host(buft)) {
         return false;
@@ -661,12 +671,25 @@ bool ModelManager::stage_tensors_to_compute_backend(const std::vector<TensorStat
             // rest, and all of them where the ring does not apply, are copied one tensor at a time.
             std::vector<char> copied(staged_tensors.size(), 0);
             copy_through_staging_ring(compute_backend, staging_buft, staged_tensors, copied);
+            // Weights in page-locked RAM go by DMA on the compute stream, all of a block queued before the one
+            // synchronization below: ggml_backend_tensor_copy waits for each tensor (0.3-0.6 ms a wait under WDDM:
+            // 4.4 GB of a text encoder in 397 tensors spent ~0.25 s waiting). The same bytes.
+            const bool async_pinned = staging_buft == ggml_backend_get_default_buffer_type(compute_backend) &&
+                                      backend_supports_async_set(compute_backend);
             for (size_t i = 0; i < staged_tensors.size(); ++i) {
                 TensorState* state          = staged_tensors[i].first;
                 ggml_tensor* managed_tensor = state->tensor;
                 ggml_tensor* staging_tensor = staged_tensors[i].second;
                 if (!copied[i]) {
-                    ggml_backend_tensor_copy(managed_tensor, staging_tensor);
+                    if (async_pinned && managed_tensor->buffer != nullptr && managed_tensor->view_src == nullptr &&
+                        is_pinned_host_buffer_type(ggml_backend_buffer_get_type(managed_tensor->buffer)) &&
+                        ggml_is_contiguous(managed_tensor) && ggml_is_contiguous(staging_tensor) &&
+                        ggml_nbytes(managed_tensor) == ggml_nbytes(staging_tensor)) {
+                        ggml_backend_tensor_set_async(compute_backend, staging_tensor, managed_tensor->data, 0,
+                                                      ggml_nbytes(managed_tensor));
+                    } else {
+                        ggml_backend_tensor_copy(managed_tensor, staging_tensor);
+                    }
                 }
                 std::swap(managed_tensor->buffer, staging_tensor->buffer);
                 std::swap(managed_tensor->data, staging_tensor->data);
