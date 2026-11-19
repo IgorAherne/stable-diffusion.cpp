@@ -1355,6 +1355,12 @@ void ModelManager::release_compute_staging_blocks(bool force,
 }
 
 void ModelManager::free_params_storage_block(ParamsStorageBlock& block) {
+    // A copy ahead may still read these weights on its thread (PrefetchBlock::copier): it ends first.
+    for (auto& entry : prefetch_blocks_) {
+        if (entry.second != nullptr && entry.second->copier.joinable()) {
+            entry.second->copier.join();
+        }
+    }
     if (block.buffer != nullptr) {
         ggml_backend_buffer_free(block.buffer);
         block.buffer = nullptr;

@@ -372,7 +372,12 @@ public:
     void cache(const std::string name, ggml_tensor* tensor, ggml_cgraph* graph = nullptr);
 
     ggml_tensor* get_cache_tensor_by_name(const std::string& name) {
-        return cache_.get(name);
+        bool unparked       = false;
+        ggml_tensor* tensor = cache_.get(name, &unparked);
+        if (unparked) {
+            sync_runtime_residency();  // back on the device (SD_PARK_RETAINED_CACHE): the capacity checks count it again
+        }
+        return tensor;
     }
 
     std::optional<sd::Tensor<float>> compute(get_graph_cb_t get_graph,

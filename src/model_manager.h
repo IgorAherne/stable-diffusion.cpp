@@ -5,8 +5,10 @@
 #include <list>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -16,6 +18,12 @@
 
 // The page-locked host slots and the events of a GPU's weight staging ring (model_manager_staging.cpp).
 class StagingRing;
+// One planned copy through a staging ring (model_manager_staging.cpp).
+struct RingCopyJob;
+// How many of the ring's readers a job uses (0: as many as a copy everything waits for), and how many a copy that
+// runs beside the compute gets (SD_PREFETCH_THREADS, default 4 at most).
+void set_ring_threads(RingCopyJob& job, int threads);
+int ring_threads_beside_compute();
 
 class ModelManager : public DeviceResidencyManager {
 public:
@@ -80,6 +88,14 @@ private:
         ggml_backend_t transfer_backend = nullptr;
         ggml_backend_event_t event      = nullptr;
         std::vector<std::unique_ptr<ComputeStagingBlock>> staging_blocks;
+        // The copy of weights in pageable RAM through the staging ring, running beside the compute; joined before
+        // the block's weights are used or its buffers freed (synchronize_prefetch_block).
+        std::thread copier;
+        ~PrefetchBlock() {
+            if (copier.joinable()) {
+                copier.join();
+            }
+        }
     };
 
     struct RuntimeResidency {
@@ -140,6 +156,16 @@ private:
                                    ggml_backend_buffer_type_t staging_buft,
                                    const std::vector<std::pair<TensorState*, ggml_tensor*>>& tensors,
                                    std::vector<char>& copied);
+    // The same in two halves, for a copy that runs on another thread: plan_ring_copy (this thread: the ring, the
+    // pieces; nullptr where the ring does not apply) sets copied[i] for each pair the job will copy, and
+    // run_ring_copy (any thread, one at a time: ring_mutex_) copies them all, piece by piece without the ring if the
+    // ring's threads cannot start, and returns when they are on the card.
+    std::shared_ptr<RingCopyJob> plan_ring_copy(ggml_backend_t compute_backend,
+                                                ggml_backend_buffer_type_t staging_buft,
+                                                const std::vector<std::pair<TensorState*, ggml_tensor*>>& tensors,
+                                                std::vector<char>& copied);
+    bool run_ring_copy(RingCopyJob& job);
+    std::mutex ring_mutex_;
     void release_staging_rings();
 
     bool resolve_required_tensor_states(const std::vector<ggml_tensor*>& tensors,

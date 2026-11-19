@@ -268,28 +268,64 @@ void ModelManager::release_staging_rings() {
     staging_rings_.clear();
 }
 
-bool ModelManager::copy_through_staging_ring(ggml_backend_t compute_backend,
-                                             ggml_backend_buffer_type_t staging_buft,
-                                             const std::vector<std::pair<TensorState*, ggml_tensor*>>& tensors,
-                                             std::vector<char>& copied) {
+// Pieces of at most one slot, packed into slot-sized batches; batch b fills slot b % slots.
+struct RingCopyJob {
+    struct Piece {
+        ggml_tensor* dst;
+        size_t dst_offset;
+        const uint8_t* src;
+        size_t size;
+        size_t slot_offset;
+        const MmapWrapper* file;  // read from this file at file_offset; nullptr: copied from src
+        size_t file_offset;
+    };
+    std::shared_ptr<StagingRing> ring;
+    ggml_backend_t transfer_backend = nullptr;
+    std::vector<Piece> pieces;
+    std::vector<size_t> batch_begin;  // the pieces of batch b: [batch_begin[b], batch_begin[b + 1])
+    size_t n_batches = 0;
+    std::vector<HostRange> prefetch_pieces;
+    int threads = 0;  // the ring's readers; 0: staging_threads()
+};
+
+// SD_PREFETCH_THREADS: the ring's readers for a copy that runs beside the compute (a block copied ahead): fewer than
+// a copy everything waits for, since it only has to keep ahead of the compute and must not slow it down.
+int ring_threads_beside_compute() {
+    static const int threads = [] {
+        const char* value = std::getenv("SD_PREFETCH_THREADS");
+        const int asked   = value != nullptr ? std::atoi(value) : 0;
+        return asked > 0 ? std::min(asked, STAGING_MAX_THREADS) : std::min(4, staging_threads());
+    }();
+    return threads;
+}
+
+void set_ring_threads(RingCopyJob& job, int threads) {
+    job.threads = threads;
+}
+
+std::shared_ptr<RingCopyJob> ModelManager::plan_ring_copy(
+    ggml_backend_t compute_backend,
+    ggml_backend_buffer_type_t staging_buft,
+    const std::vector<std::pair<TensorState*, ggml_tensor*>>& tensors,
+    std::vector<char>& copied) {
     // CUDA only: the path measured. Other GPU backends (Vulkan, ROCm, ...) keep the per-tensor copies.
     const StagingRingMode mode = staging_ring_mode();
     if (mode == StagingRingMode::Off || tensors.empty() || compute_backend == nullptr ||
         sd_backend_is_cpu(compute_backend) || !sd_backend_is(compute_backend, "CUDA")) {
-        return false;
+        return nullptr;
     }
     ggml_backend_dev_t device = ggml_backend_get_device(compute_backend);
     if (device == nullptr) {
-        return false;
+        return nullptr;
     }
     ggml_backend_dev_props props{};
     ggml_backend_dev_get_props(device, &props);
     if (!props.caps.async || !props.caps.events || !props.caps.host_buffer) {
-        return false;
+        return nullptr;
     }
     // The device's own buffer type only (not a split one): set_tensor_async requires it.
     if (staging_buft == nullptr || staging_buft != ggml_backend_get_default_buffer_type(compute_backend)) {
-        return false;
+        return nullptr;
     }
 
     // Sources in page-locked buffers keep their direct DMA; only contiguous tensors in pageable RAM come here.
@@ -313,11 +349,11 @@ bool ModelManager::copy_through_staging_ring(ggml_backend_t compute_backend,
         picked.push_back(i);
     }
     if (picked.empty()) {
-        return false;
+        return nullptr;
     }
     ggml_backend_t transfer_backend = prefetch_backend_for(compute_backend);
     if (transfer_backend == nullptr || staging_buft != ggml_backend_get_default_buffer_type(transfer_backend)) {
-        return false;
+        return nullptr;
     }
 
     auto ring_entry = staging_rings_.find(device);
@@ -336,10 +372,12 @@ bool ModelManager::copy_through_staging_ring(ggml_backend_t compute_backend,
         }
         ring_entry = staging_rings_.emplace(device, std::move(ring)).first;  // a failure is not retried
     }
-    StagingRing* ring = ring_entry->second.get();
-    if (ring == nullptr) {
-        return false;
+    if (ring_entry->second == nullptr) {
+        return nullptr;
     }
+    auto job              = std::make_shared<RingCopyJob>();
+    job->ring             = ring_entry->second;
+    job->transfer_backend = transfer_backend;
 
     // In file order: the copies and the prefetch then walk the files front to back.
     auto source_of = [&](size_t index) {
@@ -388,20 +426,10 @@ bool ModelManager::copy_through_staging_ring(ggml_backend_t compute_backend,
                storage.nbytes() == static_cast<int64_t>(ggml_nbytes(state.tensor));
     };
 
-    // Pieces of at most one slot, packed into slot-sized batches; batch b fills slot b % slots.
-    struct Piece {
-        ggml_tensor* dst;
-        size_t dst_offset;
-        const uint8_t* src;
-        size_t size;
-        size_t slot_offset;
-        const MmapWrapper* file;  // read from this file at file_offset; nullptr: copied from src
-        size_t file_offset;
-    };
-    std::vector<Piece> pieces;
-    std::vector<size_t> batch_begin;  // the pieces of batch b: [batch_begin[b], batch_begin[b + 1])
-    std::vector<HostRange> mapped;    // the sources copied from a mapping, page-aligned and merged
-    const size_t slot_bytes = ring->slot_bytes();
+    std::vector<RingCopyJob::Piece>& pieces = job->pieces;
+    std::vector<size_t>& batch_begin        = job->batch_begin;
+    std::vector<HostRange> mapped;  // the sources copied from a mapping, page-aligned and merged
+    const size_t slot_bytes = job->ring->slot_bytes();
     const uintptr_t page    = host_page_size();
     size_t slot_used        = slot_bytes;
     for (size_t index : picked) {
@@ -436,16 +464,29 @@ bool ModelManager::copy_through_staging_ring(ggml_backend_t compute_backend,
         }
         mapped.push_back({reinterpret_cast<const uint8_t*>(begin), end - begin});
     }
-    const size_t n_batches = batch_begin.size();
+    job->n_batches = batch_begin.size();
     batch_begin.push_back(pieces.size());
 
     // The page-in thread is for the mappings only: file reads need no help to read the disk in large requests.
-    std::vector<HostRange> prefetch_pieces;
     for (const HostRange& range : mapped) {
         for (size_t offset = 0; offset < range.second; offset += PREFETCH_PIECE_BYTES) {
-            prefetch_pieces.push_back({range.first + offset, std::min(PREFETCH_PIECE_BYTES, range.second - offset)});
+            job->prefetch_pieces.push_back(
+                {range.first + offset, std::min(PREFETCH_PIECE_BYTES, range.second - offset)});
         }
     }
+    for (size_t index : picked) {
+        copied[index] = 1;
+    }
+    return job;
+}
+
+bool ModelManager::run_ring_copy(RingCopyJob& job) {
+    std::lock_guard<std::mutex> one_at_a_time(ring_mutex_);
+    StagingRing* ring                     = job.ring.get();
+    ggml_backend_t transfer_backend       = job.transfer_backend;
+    const std::vector<RingCopyJob::Piece>& pieces = job.pieces;
+    const std::vector<size_t>& batch_begin        = job.batch_begin;
+    const size_t n_batches                        = job.n_batches;
 
     // Workers fill the slots they are handed (file reads, or copies from a mapping); this thread queues each filled
     // slot's DMA in order, records the slot's event and hands the slot on to a later batch once that event has
@@ -494,7 +535,7 @@ bool ModelManager::copy_through_staging_ring(ggml_backend_t compute_backend,
             }
             uint8_t* slot = ring->slot(batch % n_slots);
             for (size_t p = batch_begin[batch]; p < batch_begin[batch + 1]; ++p) {
-                const Piece& piece = pieces[p];
+                const RingCopyJob::Piece& piece = pieces[p];
                 if (piece.file != nullptr) {
                     MmapWrapper::FileReader* reader = reader_for(piece.file);
                     if (reader != nullptr && reader->read(slot + piece.slot_offset, piece.file_offset, piece.size)) {
@@ -520,9 +561,9 @@ bool ModelManager::copy_through_staging_ring(ggml_backend_t compute_backend,
         pipeline.work_cv.notify_all();
     };
 
-    MappedRangePrefetcher prefetcher(std::move(prefetch_pieces), copy_front);
+    MappedRangePrefetcher prefetcher(job.prefetch_pieces, copy_front);
     std::vector<std::thread> workers;
-    const size_t n_workers = std::min(static_cast<size_t>(staging_threads()), n_batches);
+    const size_t n_workers = std::min(static_cast<size_t>(job.threads > 0 ? job.threads : staging_threads()), n_batches);
     try {
         for (size_t i = 0; i < n_workers; ++i) {
             workers.emplace_back(worker);
@@ -531,6 +572,11 @@ bool ModelManager::copy_through_staging_ring(ggml_backend_t compute_backend,
         // fewer workers
     }
     if (workers.empty()) {
+        // the same bytes, one piece at a time (the driver stages each copy from pageable RAM itself)
+        for (const RingCopyJob::Piece& piece : pieces) {
+            ggml_backend_tensor_set_async(transfer_backend, piece.dst, piece.src, piece.dst_offset, piece.size);
+        }
+        ggml_backend_synchronize(transfer_backend);
         return false;
     }
 
@@ -567,9 +613,17 @@ bool ModelManager::copy_through_staging_ring(ggml_backend_t compute_backend,
         LOG_WARN("model manager could not read %zu pieces of the model files; they were copied from their mappings",
                  file_read_failures.load());
     }
+    return true;
+}
 
-    for (size_t index : picked) {
-        copied[index] = 1;
+bool ModelManager::copy_through_staging_ring(ggml_backend_t compute_backend,
+                                             ggml_backend_buffer_type_t staging_buft,
+                                             const std::vector<std::pair<TensorState*, ggml_tensor*>>& tensors,
+                                             std::vector<char>& copied) {
+    std::shared_ptr<RingCopyJob> job = plan_ring_copy(compute_backend, staging_buft, tensors, copied);
+    if (job == nullptr) {
+        return false;
     }
+    run_ring_copy(*job);
     return true;
 }

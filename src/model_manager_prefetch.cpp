@@ -6,6 +6,24 @@
 #include "core/ggml_extend_backend.h"
 #include "core/util.h"
 
+#include <cstdlib>
+#include <exception>
+#include <string>
+
+// SD_PREFETCH_ASYNC: unset / 1 = a block of weights copied ahead from pageable RAM goes through the staging ring on a
+// thread of its own, beside the compute of the segment before it; 0 / off = on the calling thread (the earlier way).
+static bool prefetch_copies_async() {
+    static const bool on = [] {
+        const char* value = std::getenv("SD_PREFETCH_ASYNC");
+        if (value == nullptr) {
+            return true;
+        }
+        const std::string text = value;
+        return !(text == "0" || text == "off" || text == "false" || text == "no");
+    }();
+    return on;
+}
+
 ggml_backend_t ModelManager::prefetch_backend_for(ggml_backend_t compute_backend) {
     auto existing = prefetch_backends_.find(compute_backend);
     if (existing != prefetch_backends_.end()) {
@@ -29,6 +47,9 @@ ggml_backend_t ModelManager::prefetch_backend_for(ggml_backend_t compute_backend
 }
 
 void ModelManager::synchronize_prefetch_block(PrefetchBlock& block) {
+    if (block.copier.joinable()) {
+        block.copier.join();  // its copies are on the card when it returns
+    }
     if (block.event != nullptr) {
         ggml_backend_event_synchronize(block.event);
         ggml_backend_event_free(block.event);
@@ -89,6 +110,8 @@ bool ModelManager::populate_prefetch_block(PrefetchBlock& block) {
         backend_limit = MAX_RESIDENCY_BLOCK_BYTES;
     }
 
+    const bool async = prefetch_copies_async();
+    std::vector<std::shared_ptr<RingCopyJob>> ring_jobs;
     auto enqueue_chunk = [&](const std::vector<TensorState*>& chunk) -> bool {
         if (chunk.empty()) {
             return true;
@@ -128,9 +151,17 @@ bool ModelManager::populate_prefetch_block(PrefetchBlock& block) {
         ggml_backend_buffer_set_usage(staging_block->buffer,
                                       GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
-        // An upload from pageable RAM is not asynchronous anyway (the driver stages it); the ring is faster.
+        // An upload from pageable RAM is not asynchronous (the driver stages it), so the ring's copy runs on a thread
+        // of its own while the compute goes on (SD_PREFETCH_ASYNC=0: on this thread, before the compute, as before).
         std::vector<char> copied(staging_block->staged_tensors.size(), 0);
-        copy_through_staging_ring(block.compute_backend, buffer_type, staging_block->staged_tensors, copied);
+        if (async) {
+            if (auto job = plan_ring_copy(block.compute_backend, buffer_type, staging_block->staged_tensors, copied)) {
+                set_ring_threads(*job, ring_threads_beside_compute());
+                ring_jobs.push_back(std::move(job));
+            }
+        } else {
+            copy_through_staging_ring(block.compute_backend, buffer_type, staging_block->staged_tensors, copied);
+        }
         for (size_t i = 0; i < staging_block->staged_tensors.size(); ++i) {
             if (copied[i]) {
                 continue;
@@ -172,6 +203,9 @@ bool ModelManager::populate_prefetch_block(PrefetchBlock& block) {
         chunk_size = tensor_size > SIZE_MAX - chunk_size ? SIZE_MAX : chunk_size + tensor_size;
     }
     if (!enqueue_chunk(chunk)) {
+        if (!ring_jobs.empty()) {  // planned, not started: their staging buffers are freed with the block
+            ring_jobs.clear();
+        }
         return false;
     }
 
@@ -179,6 +213,19 @@ bool ModelManager::populate_prefetch_block(PrefetchBlock& block) {
     block.event               = ggml_backend_event_new(device);
     if (block.event != nullptr) {
         ggml_backend_event_record(block.event, block.transfer_backend);
+    }
+    if (!ring_jobs.empty()) {
+        try {
+            block.copier = std::thread([this, jobs = ring_jobs]() {
+                for (const auto& job : jobs) {
+                    run_ring_copy(*job);
+                }
+            });
+        } catch (const std::exception&) {
+            for (const auto& job : ring_jobs) {  // no thread: the copy on this one, as before
+                run_ring_copy(*job);
+            }
+        }
     }
 
     size_t total_size = 0;

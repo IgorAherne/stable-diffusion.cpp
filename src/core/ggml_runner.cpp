@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cstdlib>
 #include <exception>
 #include <map>
 #include <utility>
@@ -498,6 +499,26 @@ void GGMLRunner::update_retained_cache_reclaimer() {
         manager->set_workspace_reclaimer(owner, [this]() {
             // Idle: no graph refers to the entries (a run replaces this reclaimer at runner_start).
             const size_t bytes = cache_.resident_bytes(ggml_backend_get_device(runtime_backend));
+            // SD_PARK_RETAINED_CACHE=1: the entries' bytes go to RAM instead (the same bytes come back when the next
+            // run asks for them: a re-roll then skips recomputing them, at the price of that much RAM meanwhile).
+            static const bool park = [] {
+                const char* value = std::getenv("SD_PARK_RETAINED_CACHE");
+                return value != nullptr && std::atoi(value) == 1;
+            }();
+            if (park && bytes == 0 && cache_.parked_bytes() > 0) {
+                return true;  // parked already: nothing of it on the device
+            }
+            if (park && bytes > 0) {
+                const int64_t t0 = ggml_time_us();
+                // (all of it, or it is all dropped below: an entry left on the device would keep the room taken)
+                if (cache_.park() && cache_.resident_bytes(ggml_backend_get_device(runtime_backend)) == 0) {
+                    sync_runtime_residency();
+                    LOG_VERBOSE("%s parked %.2f MB of cached tensors kept for its next run in RAM (%.0f ms): another "
+                                "runner needs the memory",
+                                get_desc().c_str(), bytes / (1024.0 * 1024.0), (ggml_time_us() - t0) / 1e3);
+                    return true;
+                }
+            }
             cache_.clear();
             sync_runtime_residency();
             LOG_VERBOSE("%s dropped %.2f MB of cached tensors kept for its next run: another runner needs the memory",
@@ -1028,8 +1049,18 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
             peak       = std::max(peak, workspace_.bytes(backend));
         }
     };
+    // SD_SEGMENT_TIMES=1: one line per graph run with where its host time went (developers' timeline; 2: per segment).
+    static const int segment_times = [] {
+        const char* value = std::getenv("SD_SEGMENT_TIMES");
+        return value != nullptr ? std::atoi(value) : 0;
+    }();
+    int64_t t_graph = ggml_time_us(), t_iter_end = t_graph;
+    int64_t us_setup = 0, us_copy = 0, us_compute = 0, us_capture = 0, us_between = 0;
     std::optional<Tensor<float>> output = Tensor<float>();
     for (size_t index = 0; index < plan.segments.size(); ++index) {
+        const int64_t t_iter = ggml_time_us();
+        us_between += t_iter - t_iter_end;
+        int64_t t_copy0 = t_iter, t_copy1 = t_iter, t_exec1 = t_iter;
         const auto& segment = plan.segments[index];
         const bool last     = index + 1 == plan.segments.size();
         auto fail_segment   = [&](const char* phase) {
@@ -1120,15 +1151,18 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
             return fail_segment("allocated capacity check");
         }
         copy_data_to_backend_tensor(segment_graph, false);
+        t_copy0                = ggml_time_us();
         auto prefetch_requests = memory_requests(measurement.buffers, new_cache_bytes);
         if (!prefetch_requests.empty()) {
             weights.enqueue_next(index, prefetch_requests.front());
         }
+        t_copy1 = ggml_time_us();
         LOG_DEBUG("%s executing segment %zu/%zu: %s", get_desc().c_str(),
                   index + 1, plan.segments.size(), segment.group_name.c_str());
         if (!execute_segment(segment_graph, n_threads)) {
             return fail_segment("execution");
         }
+        t_exec1 = ggml_time_us();
         auto cache_status = cache_.capture(segment_graph);
         if (cache_status == GGML_STATUS_SUCCESS) {
             cache_status = cut_cache_.capture(graph, segment, get_desc().c_str());
@@ -1156,6 +1190,25 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
         }
         // Final outputs and their callbacks may still be views of consumed cuts.
         cut_cache_.prune(segment.future_cut_names);
+        t_iter_end = ggml_time_us();
+        us_setup += t_copy0 - t_iter;
+        us_copy += t_copy1 - t_copy0;
+        us_compute += t_exec1 - t_copy1;
+        us_capture += t_iter_end - t_exec1;
+        if (segment_times >= 2) {
+            LOG_INFO("%s segment %zu/%zu %s: setup %.2f copy-ahead %.2f compute %.2f capture %.2f ms",
+                     get_desc().c_str(), index + 1, plan.segments.size(), segment.group_name.c_str(),
+                     (t_copy0 - t_iter) / 1e3, (t_copy1 - t_copy0) / 1e3, (t_exec1 - t_copy1) / 1e3,
+                     (t_iter_end - t_exec1) / 1e3);
+        }
+    }
+    if (segment_times >= 1) {
+        const int64_t t_end = ggml_time_us();
+        LOG_INFO("%s graph run: %zu segment%s, %.1f ms = setup %.1f + copy-ahead %.1f + compute %.1f + capture %.1f "
+                 "+ between %.1f + tail %.1f",
+                 get_desc().c_str(), plan.segments.size(), plan.segments.size() == 1 ? "" : "s",
+                 (t_end - t_graph) / 1e3, us_setup / 1e3, us_copy / 1e3, us_compute / 1e3, us_capture / 1e3,
+                 us_between / 1e3, (t_end - t_iter_end) / 1e3);
     }
     if (segments_changed || peak_compute_bytes != logged_compute_bytes_) {
         for (const auto& entry : peak_compute_bytes) {

@@ -19,6 +19,8 @@ namespace sd {
         ggml_context* context        = nullptr;
         ggml_backend_buffer_t buffer = nullptr;
         ggml_tensor* tensor          = nullptr;
+        // The bytes of an entry parked in RAM (RunnerCache::park): no device buffer until it is asked for again.
+        std::vector<uint8_t> parked;
         ~CachedTensor();
         static std::unique_ptr<CachedTensor> copy(ggml_backend_t backend,
                                                   const std::string& name,
@@ -40,7 +42,13 @@ namespace sd {
         RunnerCache(const RunnerCache&)            = delete;
         RunnerCache& operator=(const RunnerCache&) = delete;
 
-        ggml_tensor* get(const std::string& name) const;
+        // A parked entry is copied back to the device first (nullptr, and the entry dropped, when that fails);
+        // *unparked says it was parked.
+        ggml_tensor* get(const std::string& name, bool* unparked = nullptr);
+        // The committed entries' bytes moved to RAM and their device buffers freed (outside a graph); false when
+        // there was nothing on the device. The same bytes come back at the next get().
+        bool park();
+        size_t parked_bytes() const;
         void stage(const std::string& name, ggml_tensor* tensor);
         const std::map<std::string, ggml_tensor*>& outputs() const { return outputs_; }
         size_t pending_bytes(ggml_cgraph* graph) const;

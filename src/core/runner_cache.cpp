@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <iterator>
+#include <new>
 #include <unordered_set>
 
 #include "core/ggml_graph_cut.h"
@@ -78,7 +79,7 @@ namespace sd {
         size_t bytes = 0;
         for (const auto& entry : tensors) {
             auto buffer = entry.second->buffer;
-            if (!ggml_backend_buffer_is_host(buffer) &&
+            if (buffer != nullptr && !ggml_backend_buffer_is_host(buffer) &&
                 ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buffer)) == device) {
                 const size_t size = ggml_backend_buffer_get_size(buffer);
                 bytes             = size > SIZE_MAX - bytes ? SIZE_MAX : bytes + size;
@@ -87,8 +88,57 @@ namespace sd {
         return bytes;
     }
 
-    ggml_tensor* RunnerCache::get(const std::string& name) const {
-        return cached_tensor(committed_, name);
+    ggml_tensor* RunnerCache::get(const std::string& name, bool* unparked) {
+        auto entry = committed_.find(name);
+        if (entry == committed_.end()) {
+            return nullptr;
+        }
+        CachedTensor& cached = *entry->second;
+        if (!cached.parked.empty()) {
+            if (unparked != nullptr) {
+                *unparked = true;
+            }
+            cached.buffer = ggml_backend_alloc_ctx_tensors(cached.context, backend_);
+            if (cached.buffer == nullptr || ggml_nbytes(cached.tensor) != cached.parked.size()) {
+                committed_.erase(entry);  // computed again by the caller
+                return nullptr;
+            }
+            ggml_backend_tensor_set(cached.tensor, cached.parked.data(), 0, cached.parked.size());
+            std::vector<uint8_t>().swap(cached.parked);
+        }
+        return cached.tensor;
+    }
+
+    bool RunnerCache::park() {
+        bool parked = false;
+        for (auto& entry : committed_) {
+            CachedTensor& cached = *entry.second;
+            if (cached.buffer == nullptr || ggml_backend_buffer_is_host(cached.buffer) || cached.tensor == nullptr ||
+                cached.tensor->view_src != nullptr || !ggml_is_contiguous(cached.tensor)) {
+                continue;
+            }
+            try {
+                cached.parked.resize(ggml_nbytes(cached.tensor));
+            } catch (const std::bad_alloc&) {
+                std::vector<uint8_t>().swap(cached.parked);
+                break;  // no RAM for it: it stays on the device (the caller then drops the entries)
+            }
+            ggml_backend_tensor_get(cached.tensor, cached.parked.data(), 0, cached.parked.size());
+            ggml_backend_buffer_free(cached.buffer);
+            cached.buffer        = nullptr;
+            cached.tensor->buffer = nullptr;
+            cached.tensor->data   = nullptr;
+            parked                = true;
+        }
+        return parked;
+    }
+
+    size_t RunnerCache::parked_bytes() const {
+        size_t bytes = 0;
+        for (const auto& entry : committed_) {
+            bytes += entry.second->parked.size();
+        }
+        return bytes;
     }
 
     void RunnerCache::stage(const std::string& name, ggml_tensor* tensor) {
