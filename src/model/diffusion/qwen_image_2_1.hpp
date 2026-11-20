@@ -854,11 +854,12 @@ namespace Qwen {
         // (no drawn picture's rows), so it is cut into fewer layer segments where memory is short, and the step after
         // it fits whole as every later step does. The same values need the same kernels at each row count the blocks'
         // products get: the pass's P prefix rows, the REUSE step's T drawn rows, a STORE step's P + T. ggml-cuda's
-        // W8A8 int8 path, from 1,024 rows, gave every row the same bits at all three (measured); below it the k-quant
-        // kernels take the products, and their split of the sums follows the row count (a text-only prompt's ~60
-        // prefix rows changed the picture). So only where W8A8 takes the drawn picture's rows
-        // (w8a8_takes_block_products) and the prefix is at least as long, the case measured, and with a cache the
-        // pass's stand-in attention takes (qwen_image_2_1_prefix_pass_attends).
+        // W8A8 int8 path, from 1,024 rows, gave every row the same bits at all three (measured); its k-quant (MMQ)
+        // kernels do where they compute whole output tiles with J = 128 at all three counts (measured on an RTX 4060),
+        // and otherwise their split of the sums follows the row count (a text-only prompt's ~60 prefix rows changed the
+        // picture). So only where the products are alike at the three counts (block_products_rows_alike) and the
+        // prefix is at least as long, the case measured, and with a cache the pass's stand-in attention takes
+        // (qwen_image_2_1_prefix_pass_attends).
         // Off unless SD_QWEN_PREFIX_PASS=1 (read per sampling run; Spellcast3D's launcher sets it on sm_80+): on a
         // 12 GB RTX 3060 it saves ~0.5 s of a SuperTexture view's first step. The VAE graphs after it once ran ~2x
         // slower: the process at ~10.9 GB of the card, the driver had put a 64 MB allocation in shared system memory
@@ -1231,6 +1232,46 @@ namespace Qwen {
                 }
                 if (!qwen_image_2_1_w8a8_weight_type(t->type)) {
                     return false;
+                }
+                ++matrices;
+            }
+            return matrices > 0;
+        }
+
+        // Whether every transformer-block product gives each row the same bits at the prefix-only pass's P rows, the
+        // REUSE step's T and the STORE step's P + T (P >= T): all three on ggml-cuda's W8A8 path (from 1,024 rows), or
+        // none of them on it and each block matrix on ggml-cuda's MMQ kernels with J = 128 and whole output tiles at all
+        // three (the backend's ggml_backend_cuda_mmq_rows_alike: the stream-k split and the tile width follow the row
+        // count and the card's SM count, and change a row's sums when they change).
+        bool block_products_rows_alike(int64_t P, int64_t T) const {
+            if (w8a8_takes_block_products(T)) {
+                return true;
+            }
+            if (!sd_backend_is(runtime_backend, "CUDA") || params_ctx == nullptr) {
+                return false;
+            }
+            const int64_t counts[3] = {P, T, P + T};
+            for (int64_t n : counts) {
+                if (qwen_image_2_1_w8a8_env_takes_rows(n)) {
+                    return false;
+                }
+            }
+            ggml_backend_dev_t dev = ggml_backend_get_device(runtime_backend);
+            ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            typedef bool (*rows_alike_t)(ggml_backend_t, ggml_type, int64_t, int64_t, int64_t);
+            auto rows_alike = reg != nullptr ? (rows_alike_t)ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_mmq_rows_alike") : nullptr;
+            if (rows_alike == nullptr) {
+                return false;
+            }
+            int matrices = 0;
+            for (ggml_tensor* t = ggml_get_first_tensor(params_ctx); t != nullptr; t = ggml_get_next_tensor(params_ctx, t)) {
+                if (ggml_n_dims(t) < 2 || std::strstr(ggml_get_name(t), "transformer_blocks.") == nullptr) {
+                    continue;
+                }
+                for (int64_t n : counts) {
+                    if (!rows_alike(runtime_backend, t->type, t->ne[0], t->ne[1], n)) {
+                        return false;
+                    }
                 }
                 ++matrices;
             }
@@ -1718,7 +1759,7 @@ namespace Qwen {
             };
             if (cache.mode == QwenImage21PrefixCache::Mode::STORE && prefix_pass_enabled && block_id == 0 && keep_prefixes() &&
                 qwen_image_2_1_prefix_pass_attends(cache.type, flash_attn_enabled, sage_attn_enabled, attn_scale) &&
-                layout.prefix_length >= target_length && w8a8_takes_block_products(target_length)) {
+                layout.prefix_length >= target_length && block_products_rows_alike(layout.prefix_length, target_length)) {
                 auto prefix_cache = cache;
                 prefix_cache.mode = QwenImage21PrefixCache::Mode::PREFIX;
                 const int64_t t0  = ggml_time_ms();
